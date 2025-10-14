@@ -5,6 +5,8 @@ Code for:
 
 Neurips 2025 TS4H workshop 
 
+move data "sample_data_oviss.csv" to vaso_rl folder 
+
 ### training binary Q-learning model with CQL penalty (specify alpha): 
 python3 run_binary_cql_alpha00.py 
 
