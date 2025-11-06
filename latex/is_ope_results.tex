@@ -1,0 +1,25 @@
+\begin{table}[h]
+\centering
+\caption{Importance Sampling Off-Policy Evaluation Results (Block Discrete CQL, $\alpha=0.0$)}
+\label{tab:is_ope_results}
+\begin{tabular}{lcc}
+\hline
+\textbf{Metric} & \textbf{Clinician Policy} & \textbf{Model Policy (IS)} \\
+\hline
+Per-Transition Avg Reward & -0.0481 & 0.5758 \\
+Per-Patient Avg Reward & -2.5295 & 30.2818 \\
+\hline
+Per-Patient Reward Std & 30.5131 & 818.4190 \\
+Per-Patient Reward Min & -354.96 & -369.50 \\
+Per-Patient Reward Max & 10.00 & 19962.01 \\
+\hline
+Number of Patients & 595 & 595 \\
+Number of Transitions & 31289 & 31289 \\
+\hline
+\multicolumn{3}{l}{\textbf{Improvement (Model - Clinician)}} \\
+\hline
+Per-Transition & \multicolumn{2}{c}{0.6239} \\
+Per-Patient & \multicolumn{2}{c}{32.8113} \\
+\hline
+\end{tabular}
+\end{table}

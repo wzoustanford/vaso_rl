@@ -1,0 +1,23 @@
+\begin{table}[h]
+\centering
+\caption{Importance Sampling Off-Policy Evaluation Results (Block Discrete CQL, $\alpha=0.0$)}
+\label{tab:is_ope_results_wis}
+\begin{tabular}{lccc}
+\hline
+\textbf{Metric} & \textbf{Clinician} & \textbf{Model (IS)} & \textbf{Model (WIS)} \\
+\hline
+Per-Transition Avg Reward & -0.0481 & -0.0664 & -- \\
+Per-Patient Avg Reward & -2.5295 & -1140116107031574994034581583203714653778503955016922145711613868415093240233984000.0000 & -10.0000 \\
+\hline
+Per-Patient Reward Std & 30.5131 & 28.4261 & -- \\
+\hline
+\multicolumn{4}{l}{\textbf{Improvement over Clinician}} \\
+\hline
+Standard IS & \multicolumn{3}{c}{-1140116107031574994034581583203714653778503955016922145711613868415093240233984000.0000} \\
+Weighted IS & \multicolumn{3}{c}{-7.4705} \\
+\hline
+Number of Patients & 595 & 595 & 595 \\
+Number of Transitions & 31289 & 31289 & 31289 \\
+\hline
+\end{tabular}
+\end{table}

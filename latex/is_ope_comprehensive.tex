@@ -1,0 +1,26 @@
+\begin{table}[h]
+\centering
+\caption{Importance Sampling Off-Policy Evaluation Results (Block Discrete CQL, $\alpha=0.0$)}
+\label{tab:is_ope_comprehensive}
+\begin{tabular}{lcccc}
+\hline
+\textbf{Method} & \textbf{Clinician} & \textbf{Model (IS/WIS)} & \textbf{Difference} & \textbf{95\% CI} \\
+\hline
+\multicolumn{5}{l}{\textit{Per-Transition Estimates}} \\
+\hline
+Standard IS & -0.0481 & 0.5758 & 0.6239 & -- \\
+Weighted IS (WIS) & -0.0481 & 0.0748 & 0.1229 & -- \\
+\hline
+\multicolumn{5}{l}{\textit{Per-Trajectory (Per-Patient) Estimates}} \\
+\hline
+Standard IS & -2.5295 & 30.2818 & 32.8113 & -- \\
+Weighted IS (WIS) & -2.5295 & 0.0207 & 2.5501 & [0.4505, 5.1658] \\
+\hline
+\multicolumn{5}{l}{\textit{Data Summary}} \\
+\hline
+\multicolumn{2}{l}{Number of Patients} & \multicolumn{3}{c}{595} \\
+\multicolumn{2}{l}{Number of Transitions} & \multicolumn{3}{c}{31289} \\
+\multicolumn{2}{l}{Average Trajectory Length} & \multicolumn{3}{c}{52.6} \\
+\hline
+\end{tabular}
+\end{table}
