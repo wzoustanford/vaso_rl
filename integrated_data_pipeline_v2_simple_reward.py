@@ -15,97 +15,70 @@ from data_loader import DataSplitter
 
 
 def compute_outcome_reward(
-    states: np.ndarray,
-    actions: np.ndarray,
-    current_timestep: int,
+    state: np.ndarray,
+    next_state: np.ndarray,
+    action: np.ndarray,
     is_terminal: bool,
     mortality: int,
     state_features: list
 ) -> float:
     """
     Compute reward based on clinical outcomes
-
+    
     Args:
-        states: All states for this patient (T x num_features)
-        actions: All actions for this patient (T,) or (T x num_actions)
-        current_timestep: Current timestep index
+        state: Current state
+        next_state: Next state
+        action: Action taken (VP1, VP2 for dual; VP1 only for binary)
         is_terminal: Whether this is the last timestep
         mortality: Whether patient died (1) or survived (0)
         state_features: List of feature names for indexing
-
+    
     Returns:
         Reward value
     """
-    # 1. Base reward for survival at each time point
-    reward = 1.0
-
+    reward = 0.0
+    
     # Get indices for key features
     mbp_idx = state_features.index('mbp') if 'mbp' in state_features else None
     lactate_idx = state_features.index('lactate') if 'lactate' in state_features else None
-    sofa_idx = state_features.index('sofa') if 'sofa' in state_features else None
-    norepi_idx = state_features.index('norepinephrine') if 'norepinephrine' in state_features else None
 
-    state = states[current_timestep]
-
-    # 3. Benefit for improved clinical parameters
-
-    # 3a. Decreased lactate levels (check next 6 hours)
-    if lactate_idx is not None:
-        lactate_current = state[lactate_idx]
-        # Look ahead up to 6 hours (or until end of trajectory)
-        lookback_6hr = min(current_timestep + 6, len(states) - 1)
-        if lookback_6hr > current_timestep:
-            lactate_future = states[lookback_6hr][lactate_idx]
-            if lactate_future < lactate_current:
-                reward += 1.0  # Improved metabolic status
-
-    # 3b. Increased MBP to >= 65 mmHg (check next 4 hours)
+    """ 
     if mbp_idx is not None:
-        mbp_current = state[mbp_idx]
-        # Only reward if MBP was initially below 65
-        if mbp_current < 65:
-            # Look ahead up to 4 hours (or until end of trajectory)
-            lookback_4hr = min(current_timestep + 4, len(states) - 1)
-            if lookback_4hr > current_timestep:
-                mbp_future = states[lookback_4hr][mbp_idx]
-                if mbp_future >= 65:
-                    reward += 1.0  # Improved hemodynamic stability
+        mbp = state[mbp_idx]
+        next_mbp = next_state[mbp_idx]
+        
+        # Blood pressure reward
+        if next_mbp < 65:
+            reward -= 1.0  # Too low
+    
+    if lactate_idx is not None:
+        lactate = state[lactate_idx]
+        next_lactate = next_state[lactate_idx]
+        
+        # Lactate improvement reward
+        if next_lactate > 0.4:
+            reward -= 0.5  # Lactate to high
+    """
 
-    # 3c. Decreased SOFA score (check next 6 hours)
-    if sofa_idx is not None:
-        sofa_current = state[sofa_idx]
-        # Look ahead up to 6 hours (or until end of trajectory)
-        lookback_6hr = min(current_timestep + 6, len(states) - 1)
-        if lookback_6hr > current_timestep:
-            sofa_future = states[lookback_6hr][sofa_idx]
-            if sofa_future < sofa_current:
-                reward += 3.0  # Improved organ function
-
-    # 3d. Decreased norepinephrine usage (check next 4 hours)
-    # Norepinephrine can be in state (Binary CQL) or action (Dual CQL)
-    if norepi_idx is not None:
-        # Binary CQL: norepinephrine is in state
-        norepi_current = state[norepi_idx]
-        lookback_4hr = min(current_timestep + 4, len(states) - 1)
-        if lookback_4hr > current_timestep:
-            norepi_future = states[lookback_4hr][norepi_idx]
-            if norepi_future < norepi_current:
-                reward += 1.0  # Improved cardiovascular status
-    elif actions.ndim > 1 and actions.shape[1] >= 2:
-        # Dual CQL: norepinephrine is the second action
-        norepi_current = actions[current_timestep][1]
-        lookback_4hr = min(current_timestep + 4, len(actions) - 1)
-        if lookback_4hr > current_timestep:
-            norepi_future = actions[lookback_4hr][1]
-            if norepi_future < norepi_current:
-                reward += 1.0  # Improved cardiovascular status
-
-    # 2. Penalty for death in the last state
+    # Minimize vasopressor use (small penalty for high doses)
+    if len(action) == 2:  # Dual continuous
+        vp1_dose = action[0]
+        vp2_dose = action[1]
+        total_vaso = vp1_dose + vp2_dose * 2
+    else:  # Binary
+        vp1_dose = action if np.isscalar(action) else action[0]
+        total_vaso = vp1_dose
+    
+    if total_vaso > 1.0:
+        reward -= 0.1 * (total_vaso - 1.0)
+    
+    # Terminal rewards based on mortality
     if is_terminal:
-        if mortality == 1:
-            reward -= 20.0  # Death penalty
-        # Note: Survival is already rewarded through base +1.0 at each timestep
-
+        if mortality == 0:
+            reward += 10.0  # Survived
+        else:
+            reward -= 10.0  # Died
+    
     return reward
 
 
@@ -229,24 +202,24 @@ class IntegratedDataPipelineV2:
             for t in range(len(states) - 1):
                 all_states.append(states[t])
                 all_next_states.append(states[t + 1])
-
+                
                 if self.model_type == 'binary':
                     all_actions.append(actions[t])
                 else:
                     all_actions.append(actions[t])
-
+                
                 # Check if terminal
                 is_terminal = (t == len(states) - 2)
                 all_dones.append(1.0 if is_terminal else 0.0)
-
+                
                 # Compute reward (states not normalized yet)
-                # Pass full trajectory to allow looking ahead 4-6 hours
+                action_for_reward = actions[t] if self.model_type == 'dual' else np.array([actions[t]])
                 reward = compute_outcome_reward(
-                    states, actions, t,
+                    states[t], states[t + 1], action_for_reward,
                     is_terminal, mortality, state_features
                 )
                 all_rewards.append(reward)
-
+                
                 all_patient_ids.append(patient_id)
                 current_idx += 1
             
