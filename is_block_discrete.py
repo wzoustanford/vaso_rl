@@ -1,4 +1,4 @@
-## claude's questions and answers
+## questions and answers
 #1. Which trained model should I load? Should I use a specific alpha value (0.0, 0.001, 0.01) or a specific checkpoint? Or should I train a new one?
 # - first let's use /scratch/zouwil/code/ucsf_rl/experiment/block_discrete_cql_alpha0.0000_bins5_best.pt with 5 bins and alpha = 0 
 #  2. Block discrete binning: Should I use the same 5 bins [0, 0.05, 0.1, 0.2, 0.5] for VP2 as defined in data_config.py?
