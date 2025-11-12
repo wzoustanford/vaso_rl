@@ -24,3 +24,31 @@ python3 run_lstm_block_discrete_cql_with_logging.py
 
 ### FQE off-policy evaluation: 
 read and use ope_exp.py and fqe_gaussian_analysis.py, the pkl files could be saved during training 
+
+### WIS importance sampling evaluation: 
+read and use is_block_discrete.py, for example of evaluating the block discrete model. The same evaluation can be implemented for other models by changing the model definition and loading paths 
+
+### reward functions: 
+neurips reward definition is given in integrated_data_pipeline_v2_simple_reward.py, and OVISS reward definition is given in integrated_data_pipeline_v2.py 
+
+### hyper-parameters 
+
+# neurips simple reward 
+Learning Rate (lr) 10−3 Adam optimizer learning rate
+Batch Size 128 Training batch size
+Gamma (γ) 0.95 Discount factor for future rewards
+Tau (τ ) 0.8 Soft target network update rate
+Gradient Clipping 1.0 Maximum gradient norm
+Epochs 100 Training epochs
+Validation Batches 10 Batches for validation evaluation
+Random Seed 42 For reproducibility 
+
+# oviss reward 
+Learning Rate (lr) 10−3 Adam optimizer learning rate
+Batch Size 128 Training batch size
+Gamma (γ) 0.99 Discount factor for future rewards [aligned with oviss]
+Tau (τ ) 0.95 Soft target network update rate [more aligned with oviss using FQI]
+Gradient Clipping 1.0 Maximum gradient norm
+Epochs 100 Training epochs
+Validation Batches 10 Batches for validation evaluation
+Random Seed 42 For reproducibility

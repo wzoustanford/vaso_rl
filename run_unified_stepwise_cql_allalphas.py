@@ -25,7 +25,7 @@ import sys
 import pdb
 
 # Import our unified pipeline
-from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
+from integrated_data_pipeline_v2_simple_reward import IntegratedDataPipelineV2
 
 # Force unbuffered output
 sys.stdout = sys.__stdout__
@@ -683,9 +683,9 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Train Stepwise CQL')
-    parser.add_argument('--alpha', type=float, required=True,
+    parser.add_argument('--alpha', type=float, default=0.0,
                         help='CQL regularization parameter')
-    parser.add_argument('--max_step', type=float, required=True,
+    parser.add_argument('--max_step', type=float, default=0.2,
                         help='Maximum step size for VP2 changes')
     args = parser.parse_args()
     

@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Dict, Tuple
 
 # Import our components
-from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
+from integrated_data_pipeline_v2_simple_reward import IntegratedDataPipelineV2
 from medical_sequence_buffer import MedicalSequenceBuffer, SequenceDataLoader
 from lstm_block_discrete_cql_network import LSTMBlockDiscreteCQL
 from fqe_gaussian_analysis import FQEGaussianAnalysis, save_histogram_plot, save_q_values_to_pickle
@@ -503,8 +503,8 @@ def main():
         batch_size=32,
         epochs=200,  # Full 100 epochs
         learning_rate=1e-3,
-        tau=0.8,
-        gamma=0.95,
+        tau=0.95,
+        gamma=0.99,
         grad_clip=1.0,
         buffer_capacity=50000,
         log_every=1  # Log every epoch

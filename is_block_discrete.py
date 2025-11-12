@@ -1,5 +1,17 @@
+## claude's questions and answers
+#1. Which trained model should I load? Should I use a specific alpha value (0.0, 0.001, 0.01) or a specific checkpoint? Or should I train a new one?
+# - first let's use /scratch/zouwil/code/ucsf_rl/experiment/block_discrete_cql_alpha0.0000_bins5_best.pt with 5 bins and alpha = 0 
+#  2. Block discrete binning: Should I use the same 5 bins [0, 0.05, 0.1, 0.2, 0.5] for VP2 as defined in data_config.py?
+# - with 5 bins [0, 0.05, 0.1, 0.2, 0.5] 
+#  3. Epsilon for numerical stability: What value should I use for eps in the denominator to avoid division by zero?
+# - let's try 1e-10 first, later we may have to use larger values or apply truncation 
+#  4. Output location: Where should I save the LaTeX table output? 
+# creat a folder vaso_rl/latex/
+#  5. Test data only: Should I perform IS-OPE only on test data, or also report validation results?
+# - only on test data for now I think there are no hyperparameters for the softmax or logistic classifier model for probability estimation 
+
 ### import relevant libraries
-import torch
+import torch, pdb
 import torch.nn as nn
 import numpy as np
 import pandas as pd
@@ -38,6 +50,7 @@ q2_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(
 
 # Load the trained model checkpoint
 model_path = '/scratch/zouwil/code/ucsf_rl/experiment/block_discrete_cql_alpha0.0000_bins5_best.pt'
+#model_path = '/scratch/zouwil/code/vaso_rl/experiment/block_discrete_cql_alpha0.0000_bins5_best.pt'
 checkpoint = torch.load(model_path, map_location=device)
 q1_network.load_state_dict(checkpoint['q1_state_dict'])
 q2_network.load_state_dict(checkpoint['q2_state_dict'])
@@ -339,6 +352,7 @@ print(f"  Difference:                 {avg_is_reward_per_patient - avg_raw_rewar
 # Compute per-patient statistics (std, min, max) - requires loop
 print(f"\nComputing per-patient statistics...")
 patient_raw_rewards = []
+patient_raw_rewards_ave = []
 patient_is_rewards = []
 
 for patient_id in unique_patients:
@@ -346,9 +360,11 @@ for patient_id in unique_patients:
     patient_raw_reward = test_rewards[patient_mask].sum()
     patient_is_reward = is_weighted_rewards[patient_mask].sum()
     patient_raw_rewards.append(patient_raw_reward)
+    patient_raw_rewards_ave.append(patient_raw_reward/len(test_rewards[patient_mask]))
     patient_is_rewards.append(patient_is_reward)
 
 patient_raw_rewards = np.array(patient_raw_rewards)
+patient_raw_rewards_ave = np.array(patient_raw_rewards_ave)
 patient_is_rewards = np.array(patient_is_rewards)
 
 print(f"\nPer-patient reward statistics:")
@@ -464,6 +480,7 @@ for patient_id in unique_patients:
 
     wis_trajectory = sum_weighted_rewards_patient / sum_weights_patient if sum_weights_patient > 0 else 0.0
     wis_per_trajectory_list.append(wis_trajectory)
+    
 
 wis_per_trajectory_list = np.array(wis_per_trajectory_list)
 
@@ -471,7 +488,8 @@ wis_per_trajectory_list = np.array(wis_per_trajectory_list)
 wis_per_trajectory_mean = wis_per_trajectory_list.mean()
 
 # Also compute raw clinician per-trajectory for comparison
-clinician_per_trajectory_mean = patient_raw_rewards.mean()
+#clinician_per_trajectory_mean = patient_raw_rewards.mean()
+clinician_per_trajectory_mean = patient_raw_rewards_ave.mean()
 
 # Compute 95% confidence interval using bootstrapping for the DIFFERENCE
 print(f"\nComputing 95% CI for difference using bootstrapping (1000 iterations)...")
@@ -481,7 +499,7 @@ print(f"\nComputing 95% CI for difference using bootstrapping (1000 iterations).
 # For model: WIS per trajectory (already computed)
 # Difference: s = WIS_model - raw_clinician for each patient
 
-trajectory_differences = wis_per_trajectory_list - patient_raw_rewards
+trajectory_differences = wis_per_trajectory_list - patient_raw_rewards_ave
 
 # Bootstrap from the bag of differences
 n_bootstrap = 1000
@@ -567,15 +585,3 @@ with open(latex_file_comprehensive, 'w') as f:
     f.write(latex_comprehensive)
 
 print(f"Comprehensive results saved to: {latex_file_comprehensive}") 
-
-## questions and answers
-#1. Which trained model should I load? Should I use a specific alpha value (0.0, 0.001, 0.01) or a specific checkpoint? Or should I train a new one?
-# - first let's use /scratch/zouwil/code/ucsf_rl/experiment/block_discrete_cql_alpha0.0000_bins5_best.pt with 5 bins and alpha = 0 
-#  2. Block discrete binning: Should I use the same 5 bins [0, 0.05, 0.1, 0.2, 0.5] for VP2 as defined in data_config.py?
-# - with 5 bins [0, 0.05, 0.1, 0.2, 0.5] 
-#  3. Epsilon for numerical stability: What value should I use for eps in the denominator to avoid division by zero?
-# - let's try 1e-10 first, later we may have to use larger values or apply truncation 
-#  4. Output location: Where should I save the LaTeX table output? 
-# creat a folder vaso_rl/latex/
-#  5. Test data only: Should I perform IS-OPE only on test data, or also report validation results?
-# - only on test data for now I think there are no hyperparameters for the softmax or logistic classifier model for probability estimation 
