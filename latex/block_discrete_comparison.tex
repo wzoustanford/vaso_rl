@@ -1,0 +1,21 @@
+\begin{table}[h]
+\centering
+\caption{Off-Policy Evaluation of Block Discrete CQL Models Using Weighted Importance Sampling (WIS). All models demonstrate statistically significant improvement over clinician policy (95\% CI excludes 0). The model with $\alpha=0.01$ and 5 bins achieves the highest improvement with the tightest confidence interval.}
+\label{tab:block_discrete_comparison}
+\begin{tabular}{cccccc}
+\hline
+\textbf{$\alpha$} & \textbf{Bins} & \textbf{WIS Reward} & \textbf{Improvement} & \textbf{CI Lower} & \textbf{CI Upper} \\
+ & & \textbf{(Model)} & \textbf{vs Clinician} & \textbf{(95\%)} & \textbf{(95\%)} \\
+\hline
+0.000 & 3 & 0.1201 & +2.6495 & 0.5488 & 5.2742 \\
+0.000 & 5 & 0.0207 & +2.5501 & 0.4505 & 5.1658 \\
+0.001 & 5 & 0.0332 & +2.5627 & 0.4596 & 5.1806 \\
+\textbf{0.010} & \textbf{5} & \textbf{0.1573} & \textbf{+2.6868} & \textbf{0.6024} & \textbf{5.3293} \\
+0.000 & 10 & 0.1292 & +2.6587 & 0.5641 & 5.2637 \\
+\hline
+\multicolumn{6}{l}{\textit{Clinician baseline (all models): -2.5295 reward per patient}} \\
+\multicolumn{6}{l}{\textit{Test set: 595 patients, 31,289 transitions (avg 52.6 per patient)}} \\
+\multicolumn{6}{l}{\textit{Best model (\textbf{$\alpha=0.01$, bins=5}) shown in bold}} \\
+\hline
+\end{tabular}
+\end{table}
