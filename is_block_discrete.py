@@ -1,15 +1,3 @@
-## claude's questions and answers
-#1. Which trained model should I load? Should I use a specific alpha value (0.0, 0.001, 0.01) or a specific checkpoint? Or should I train a new one?
-# - first let's use /scratch/zouwil/code/ucsf_rl/experiment/block_discrete_cql_alpha0.0000_bins5_best.pt with 5 bins and alpha = 0 
-#  2. Block discrete binning: Should I use the same 5 bins [0, 0.05, 0.1, 0.2, 0.5] for VP2 as defined in data_config.py?
-# - with 5 bins [0, 0.05, 0.1, 0.2, 0.5] 
-#  3. Epsilon for numerical stability: What value should I use for eps in the denominator to avoid division by zero?
-# - let's try 1e-10 first, later we may have to use larger values or apply truncation 
-#  4. Output location: Where should I save the LaTeX table output? 
-# creat a folder vaso_rl/latex/
-#  5. Test data only: Should I perform IS-OPE only on test data, or also report validation results?
-# - only on test data for now I think there are no hyperparameters for the softmax or logistic classifier model for probability estimation 
-
 ### import relevant libraries
 import torch, pdb
 import torch.nn as nn
