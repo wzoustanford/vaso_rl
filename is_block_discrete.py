@@ -1,15 +1,3 @@
-## claude's questions and answers
-#1. Which trained model should I load? Should I use a specific alpha value (0.0, 0.001, 0.01) or a specific checkpoint? Or should I train a new one?
-# - first let's use /scratch/zouwil/code/ucsf_rl/experiment/block_discrete_cql_alpha0.0000_bins5_best.pt with 5 bins and alpha = 0 
-#  2. Block discrete binning: Should I use the same 5 bins [0, 0.05, 0.1, 0.2, 0.5] for VP2 as defined in data_config.py?
-# - with 5 bins [0, 0.05, 0.1, 0.2, 0.5] 
-#  3. Epsilon for numerical stability: What value should I use for eps in the denominator to avoid division by zero?
-# - let's try 1e-10 first, later we may have to use larger values or apply truncation 
-#  4. Output location: Where should I save the LaTeX table output? 
-# creat a folder vaso_rl/latex/
-#  5. Test data only: Should I perform IS-OPE only on test data, or also report validation results?
-# - only on test data for now I think there are no hyperparameters for the softmax or logistic classifier model for probability estimation 
-
 ### import relevant libraries
 import torch, pdb
 import torch.nn as nn
@@ -27,8 +15,9 @@ from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
 
 # Define constants
 STATE_DIM = 17  # 17 state features for dual model
-ACTION_BINS_5 = [0, 0.05, 0.1, 0.2, 0.5]  # VP2 discretization bins 
 
+#[C-change: please make this selectable or implement the range]
+ACTION_BINS_5 = [0, 0.05, 0.1, 0.2, 0.5]  # VP2 discretization bins 
 
 ### define the block discrete model
 # - load the trained block discrete model
@@ -39,8 +28,12 @@ print(f"Using device: {device}")
 from run_block_discrete_cql_allalphas import DualBlockDiscreteQNetwork
 
 # Model parameters
+
+#[C-change: please make this selectable]
 n_bins = 5
 action_bins = ACTION_BINS_5  # [0, 0.05, 0.1, 0.2, 0.5]
+
+
 n_actions = 2 * n_bins  # VP1 (2 options: 0,1) x VP2 (5 bins) = 10 total actions
 state_dim = STATE_DIM  # 17 features
 
@@ -49,8 +42,10 @@ q1_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(
 q2_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
 
 # Load the trained model checkpoint
-model_path = '/scratch/zouwil/code/ucsf_rl/experiment/block_discrete_cql_alpha0.0000_bins5_best.pt'
-#model_path = '/scratch/zouwil/code/vaso_rl/experiment/block_discrete_cql_alpha0.0000_bins5_best.pt'
+
+#[C-change: please make this selectable from a list of pre-trained models]
+model_path = 'experiment/vaso_rl_models_revised_reward/block_discrete_cql_alpha0.0000_bins5_best.pt'
+
 checkpoint = torch.load(model_path, map_location=device)
 q1_network.load_state_dict(checkpoint['q1_state_dict'])
 q2_network.load_state_dict(checkpoint['q2_state_dict'])
@@ -62,8 +57,6 @@ print(f"State dimension: {state_dim}")
 print(f"Number of actions: {n_actions} (VP1: 2 binary × VP2: {n_bins} bins)")
 print(f"Action bins for VP2: {action_bins}")
 print("Using min(Q1, Q2) for action selection (double Q-learning)") 
-
-
 
 ###
 # prepare and load the data with random seed 42 with all the data in a sequence, for example:
@@ -353,6 +346,7 @@ print(f"  Difference:                 {avg_is_reward_per_patient - avg_raw_rewar
 print(f"\nComputing per-patient statistics...")
 patient_raw_rewards = []
 patient_raw_rewards_ave = []
+
 patient_is_rewards = []
 
 for patient_id in unique_patients:
@@ -479,7 +473,7 @@ for patient_id in unique_patients:
     sum_weights_patient = patient_weights.sum()
 
     wis_trajectory = sum_weighted_rewards_patient / sum_weights_patient if sum_weights_patient > 0 else 0.0
-    wis_per_trajectory_list.append(wis_trajectory)
+    wis_per_trajectory_list.append(wis_trajectory * sum(patient_mask))
     
 
 wis_per_trajectory_list = np.array(wis_per_trajectory_list)
@@ -488,8 +482,8 @@ wis_per_trajectory_list = np.array(wis_per_trajectory_list)
 wis_per_trajectory_mean = wis_per_trajectory_list.mean()
 
 # Also compute raw clinician per-trajectory for comparison
-#clinician_per_trajectory_mean = patient_raw_rewards.mean()
-clinician_per_trajectory_mean = patient_raw_rewards_ave.mean()
+clinician_per_trajectory_mean = patient_raw_rewards.mean()
+#clinician_per_trajectory_mean = patient_raw_rewards_ave.mean()
 
 # Compute 95% confidence interval using bootstrapping for the DIFFERENCE
 print(f"\nComputing 95% CI for difference using bootstrapping (1000 iterations)...")
@@ -499,7 +493,7 @@ print(f"\nComputing 95% CI for difference using bootstrapping (1000 iterations).
 # For model: WIS per trajectory (already computed)
 # Difference: s = WIS_model - raw_clinician for each patient
 
-trajectory_differences = wis_per_trajectory_list - patient_raw_rewards_ave
+trajectory_differences = wis_per_trajectory_list - patient_raw_rewards
 
 # Bootstrap from the bag of differences
 n_bootstrap = 1000
