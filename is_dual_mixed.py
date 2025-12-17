@@ -13,52 +13,52 @@ warnings.filterwarnings('ignore')
 # Import project modules
 from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
 
-# number of bins 
-n_bins = 10
-
-# Define constants
-STATE_DIM = 17  # 17 state features for dual model
-
-### define the block discrete model
-# - load the trained block discrete model
+### define the binary CQL model
+# - load the trained binary CQL model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-# Import the network class from the training script
-from run_block_discrete_cql_allalphas import DualBlockDiscreteQNetwork
+# Import the DualMixedCQL class from the training script
+from run_dualmixed_cql_allalphas import DualMixedCQL
 
 # Model parameters
-n_actions = 2 * n_bins  # VP1 (2 options: 0,1) x VP2 (5 bins) = 10 total actions
-state_dim = STATE_DIM  # 17 features
+state_dim = 17  # 17 state features for dual model (VP2 not included in state)
 
-# Initialize Q-networks (we use both Q1 and Q2, then take min)
-q1_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
-q2_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
+# Initialize DualMixedCQL agent (VP1 binary + VP2 continuous)
+dual_agent = DualMixedCQL(
+    state_dim=state_dim,
+    alpha=0.0,
+    gamma=0.95,
+    tau=0.8,
+    lr=1e-3,
+    device=device
+)
 
 # Load the trained model checkpoint
-
-#[C-change: please make this selectable from a list of pre-trained models]
-model_path = f'experiment/epoch500_new_trained_oviss_reward_models/block_discrete_cql_alpha0.0000_bins{n_bins}_final.pt'
+model_path = 'experiment/epoch500_new_trained_oviss_reward_models/dual_rev_cql_alpha0.0000_best.pt'
 
 checkpoint = torch.load(model_path, map_location=device)
-q1_network.load_state_dict(checkpoint['q1_state_dict'])
-q2_network.load_state_dict(checkpoint['q2_state_dict'])
-q1_network.eval()
-q2_network.eval()
+dual_agent.q1.load_state_dict(checkpoint['q1_state_dict'])
+dual_agent.q2.load_state_dict(checkpoint['q2_state_dict'])
+dual_agent.q1.eval()
+dual_agent.q2.eval()
 
 print(f"Loaded model from: {model_path}")
 print(f"State dimension: {state_dim}")
-print(f"Number of actions: {n_actions} (VP1: 2 binary × VP2: {n_bins} bins)")
+print(f"Action space: VP1 binary (0 or 1) + VP2 continuous [0.0, 0.5]")
 print("Using min(Q1, Q2) for action selection (double Q-learning)") 
 
 ###
-# prepare and load the data with random seed 42 
+# prepare and load the data with random seed 42 with all the data in a sequence, for example:
+# pipeline = IntegratedDataPipelineV2(model_type='dual', random_seed=42)
+# train_data, val_data, test_data = pipeline.prepare_data()
 
 print("\n" + "="*70)
 print("LOADING DATA")
 print("="*70)
 
 # Initialize data pipeline with random seed 42
+#[C-change]: changed data pipeline input: to 'dual'
 pipeline = IntegratedDataPipelineV2(model_type='dual', random_seed=42)
 train_data, val_data, test_data = pipeline.prepare_data()
 
@@ -84,6 +84,7 @@ print(f"  States:  {train_data['states'].shape}")
 print(f"  Actions: {train_data['actions'].shape}")
 print(f"  Rewards: {train_data['rewards'].shape}")
 
+
 ## use the trained model to predict the optimal actions predicted by the model
 ## for example to get model actions: model_actions = model.select_action(states)
 ## for example to get clinician actions: clinician_actions = data.actions
@@ -93,15 +94,22 @@ print("\n" + "="*70)
 print("GENERATING MODEL ACTIONS")
 print("="*70)
 
-# Define VP2 bin edges (exactly as in training script)
-vp2_bin_edges = np.linspace(0, 0.5, n_bins + 1)
-print(f"VP2 bin edges: {vp2_bin_edges}")
-
-# Helper function to select actions and return DISCRETE indices (0-9)
-def select_action_batch_discrete(states, q1_net, q2_net, vp2_bins, device):
+# Helper function to select dual mixed actions (VP1 binary + VP2 continuous)
+def select_action_batch_dual_mixed(states, agent, device, n_vp2_samples=50):
     """
-    Select best actions for a batch of states using min(Q1, Q2)
-    Returns: numpy array of discrete action indices [0-9]
+    Select best dual mixed actions for a batch of states.
+    - VP1: Binary (0 or 1) selected using Q-values
+    - VP2: Continuous [0.0, 0.5] sampled uniformly and selected using Q-values
+
+    Args:
+        states: [batch_size, state_dim] numpy array
+        agent: DualMixedCQL agent
+        device: torch device
+        n_vp2_samples: Number of VP2 samples to evaluate (default: 50)
+
+    Returns:
+        vp1_actions: [batch_size] numpy array of binary actions (0 or 1)
+        vp2_actions: [batch_size] numpy array of continuous actions [0.0, 0.5]
     """
     with torch.no_grad():
         if states.ndim == 1:
@@ -110,72 +118,105 @@ def select_action_batch_discrete(states, q1_net, q2_net, vp2_bins, device):
         batch_size = states.shape[0]
         state_tensor = torch.FloatTensor(states).to(device)
 
-        # Create all possible discrete actions for each state in batch
-        total_actions = 2 * vp2_bins  # 10 actions
-        all_actions = torch.arange(total_actions).to(device)
-        all_actions = all_actions.unsqueeze(0).expand(batch_size, -1)
+        # Sample VP2 values uniformly from [0.0, 0.5]
+        vp2_samples = torch.linspace(0.0, 0.5, n_vp2_samples).to(device)
 
-        # Expand states to match actions
-        state_expanded = state_tensor.unsqueeze(1).expand(-1, total_actions, -1)
-        state_expanded = state_expanded.reshape(-1, state_dim)
-        actions_flat = all_actions.reshape(-1)
+        best_vp1 = []
+        best_vp2 = []
 
-        # Compute Q-values for all actions
-        q1_values = q1_net(state_expanded, actions_flat).reshape(batch_size, total_actions)
-        q2_values = q2_net(state_expanded, actions_flat).reshape(batch_size, total_actions)
-        q_values = torch.min(q1_values, q2_values)
+        # For each state, evaluate all combinations of VP1 and VP2
+        for i in range(batch_size):
+            state = state_tensor[i:i+1]  # [1, state_dim]
 
-        # Get best action indices (0-9)
-        best_action_indices = q_values.argmax(dim=1).cpu().numpy()
+            max_q_value = -float('inf')
+            best_vp1_i = 0
+            best_vp2_i = 0.0
 
-        return best_action_indices
+            # Try both VP1 values (0 and 1)
+            for vp1_val in [0, 1]:
+                vp1_tensor = torch.full((n_vp2_samples, 1), vp1_val, dtype=torch.float32).to(device)
+                vp2_tensor = vp2_samples.unsqueeze(1)  # [n_vp2_samples, 1]
 
-# Helper function to convert continuous actions to discrete indices
-def continuous_to_discrete_action(actions, vp2_edges, vp2_bins):
-    """
-    Convert continuous actions [vp1, vp2] to discrete action indices (0-9)
-    action_idx = vp1 * n_bins + vp2_bin
-    """
-    vp1 = actions[:, 0].astype(int)  # Binary 0 or 1
-    vp2 = actions[:, 1].clip(0, 0.5)
+                # Expand state to match VP2 samples
+                state_expanded = state.expand(n_vp2_samples, -1)  # [n_vp2_samples, state_dim]
 
-    # Convert VP2 continuous to bin index
-    vp2_bins_idx = np.digitize(vp2, vp2_edges) - 1
-    vp2_bins_idx = np.clip(vp2_bins_idx, 0, len(vp2_edges) - 2)
+                # Concatenate: [state, vp1, vp2]
+                action = torch.cat([vp1_tensor, vp2_tensor], dim=1)
+                
+                # Get Q-values using min(Q1, Q2)
+                q1_vals = agent.q1(state_expanded, action).squeeze()
+                q2_vals = agent.q2(state_expanded, action).squeeze()
+                q_vals = torch.min(q1_vals, q2_vals)
 
-    # Combine: action_idx = vp1 * n_bins + vp2_bin
-    action_indices = vp1 * vp2_bins + vp2_bins_idx
-    return action_indices
+                # Find best VP2 for this VP1
+                max_q_for_vp1, max_idx = q_vals.max(dim=0)
 
-# Get model actions as discrete indices (0-9)
-print("Computing model actions (discrete) for training data...")
-train_model_actions_discrete = select_action_batch_discrete(train_data['states'], q1_network, q2_network, n_bins, device)
+                if max_q_for_vp1 > max_q_value:
+                    max_q_value = max_q_for_vp1
+                    best_vp1_i = vp1_val
+                    best_vp2_i = vp2_samples[max_idx].item()
 
-print("Computing model actions (discrete) for test data...")
-test_model_actions_discrete = select_action_batch_discrete(test_data['states'], q1_network, q2_network, n_bins, device)
+            best_vp1.append(best_vp1_i)
+            best_vp2.append(best_vp2_i)
 
-# Convert clinician continuous actions to discrete indices (0-9)
-train_clinician_actions_discrete = continuous_to_discrete_action(train_data['actions'], vp2_bin_edges, n_bins)
-test_clinician_actions_discrete = continuous_to_discrete_action(test_data['actions'], vp2_bin_edges, n_bins)
+        return np.array(best_vp1), np.array(best_vp2)
 
-print(f"\nDiscrete action indices generated:")
-print(f"  Train model actions:     {train_model_actions_discrete.shape}")
-print(f"  Train clinician actions: {train_clinician_actions_discrete.shape}")
-print(f"  Test model actions:      {test_model_actions_discrete.shape}")
-print(f"  Test clinician actions:  {test_clinician_actions_discrete.shape}")
+# Get model dual mixed actions (VP1 binary + VP2 continuous)
+print("Computing model dual mixed actions for training data...")
+train_model_vp1, train_model_vp2 = select_action_batch_dual_mixed(
+    train_data['states'],
+    dual_agent,
+    device,
+    n_vp2_samples=50
+)
 
-# Display sample discrete actions
-print(f"\nSample discrete action indices (first 10):")
-print(f"  Model (train):     {train_model_actions_discrete[:10]}")
-print(f"  Clinician (train): {train_clinician_actions_discrete[:10]}")
+print("Computing model dual mixed actions for test data...")
+test_model_vp1, test_model_vp2 = select_action_batch_dual_mixed(
+    test_data['states'],
+    dual_agent,
+    device,
+    n_vp2_samples=50
+)
 
-# Show action distribution (0-9)
-print(f"\nAction distribution (0-9):")
-for action_idx in range(n_actions):
-    print(f"  Action {action_idx}: Model (train)={np.sum(train_model_actions_discrete==action_idx)}, "
-          f"Clinician (train)={np.sum(train_clinician_actions_discrete==action_idx)}, "
-          f"Model (test)={np.sum(test_model_actions_discrete==action_idx)}, "
-          f"Clinician (test)={np.sum(test_clinician_actions_discrete==action_idx)}") 
+# Extract clinician actions and clip VP2 to [0.0, 0.5]
+# train_data['actions'] shape: [n_transitions, 2] where [:, 0]=VP1, [:, 1]=VP2
+train_clinician_vp1 = train_data['actions'][:, 0]  # Binary: 0 or 1
+train_clinician_vp2 = np.clip(train_data['actions'][:, 1], 0.0, 0.5)  # Clipped to [0.0, 0.5]
+
+test_clinician_vp1 = test_data['actions'][:, 0]  # Binary: 0 or 1
+test_clinician_vp2 = np.clip(test_data['actions'][:, 1], 0.0, 0.5)  # Clipped to [0.0, 0.5]
+
+print(f"\nDual mixed actions generated:")
+print(f"  Train model VP1:       {train_model_vp1.shape} (binary)")
+print(f"  Train model VP2:       {train_model_vp2.shape} (continuous [0.0, 0.5])")
+print(f"  Train clinician VP1:   {train_clinician_vp1.shape} (binary)")
+print(f"  Train clinician VP2:   {train_clinician_vp2.shape} (continuous [0.0, 0.5])")
+print(f"  Test model VP1:        {test_model_vp1.shape} (binary)")
+print(f"  Test model VP2:        {test_model_vp2.shape} (continuous [0.0, 0.5])")
+print(f"  Test clinician VP1:    {test_clinician_vp1.shape} (binary)")
+print(f"  Test clinician VP2:    {test_clinician_vp2.shape} (continuous [0.0, 0.5])")
+
+# Display sample actions
+print(f"\nSample actions (first 5):")
+print(f"  Model VP1 (train):     {train_model_vp1[:5]}")
+print(f"  Model VP2 (train):     {train_model_vp2[:5]}")
+print(f"  Clinician VP1 (train): {train_clinician_vp1[:5]}")
+print(f"  Clinician VP2 (train): {train_clinician_vp2[:5]}")
+
+# Show VP1 distribution (binary: 0 or 1)
+print(f"\nVP1 distribution (binary: 0 or 1):")
+for vp1_val in [0, 1]:
+    print(f"  VP1={vp1_val}: Model (train)={np.sum(train_model_vp1==vp1_val)}, "
+          f"Clinician (train)={np.sum(train_clinician_vp1==vp1_val)}, "
+          f"Model (test)={np.sum(test_model_vp1==vp1_val)}, "
+          f"Clinician (test)={np.sum(test_clinician_vp1==vp1_val)}")
+
+# Show VP2 statistics
+print(f"\nVP2 statistics (continuous [0.0, 0.5]):")
+print(f"  Model (train):     Mean={train_model_vp2.mean():.4f}, Std={train_model_vp2.std():.4f}, Min={train_model_vp2.min():.4f}, Max={train_model_vp2.max():.4f}")
+print(f"  Clinician (train): Mean={train_clinician_vp2.mean():.4f}, Std={train_clinician_vp2.std():.4f}, Min={train_clinician_vp2.min():.4f}, Max={train_clinician_vp2.max():.4f}")
+print(f"  Model (test):      Mean={test_model_vp2.mean():.4f}, Std={test_model_vp2.std():.4f}, Min={test_model_vp2.min():.4f}, Max={test_model_vp2.max():.4f}")
+print(f"  Clinician (test):  Mean={test_clinician_vp2.mean():.4f}, Std={test_clinician_vp2.std():.4f}, Min={test_clinician_vp2.min():.4f}, Max={test_clinician_vp2.max():.4f}") 
 
 ## train a logistic classifier (lg_vp1_ma) to predict the vp1 model actions (binary) using the states on the training data, then use it on the test data to get the probability of clinician vp1 actions
 ## train a logistic classifier (lg_vp1_ca) to predict the vp1 clinician actions (binary) using the states on the training data, then use it on the test data to get the probability of clinician vp1 actions
@@ -184,50 +225,131 @@ for action_idx in range(n_actions):
 ## save the test data probabilities, and display some of them (each of the four)
 
 print("\n" + "="*70)
-print("TRAINING BEHAVIOR POLICY CLASSIFIERS (JOINT ACTION SPACE)")
+print("TRAINING BEHAVIOR POLICY CLASSIFIERS & REGRESSORS")
 print("="*70)
 
-# Train softmax classifier for model actions (0-9)
-print("\n1. Training softmax classifier for model actions (10 classes)...")
-clf_model = LogisticRegression(multi_class='multinomial', solver='lbfgs', max_iter=1000, random_state=42)
-clf_model.fit(train_data['states'], train_model_actions_discrete)
-train_acc_model = accuracy_score(train_model_actions_discrete, clf_model.predict(train_data['states']))
-test_acc_model = accuracy_score(test_model_actions_discrete, clf_model.predict(test_data['states']))
-print(f"   Train accuracy: {train_acc_model:.4f}")
-print(f"   Test accuracy:  {test_acc_model:.4f}")
+from sklearn.linear_model import LinearRegression, Ridge
+from scipy.stats import norm
 
-# Train softmax classifier for clinician actions (0-9)
-print("\n2. Training softmax classifier for clinician actions (10 classes)...")
-clf_clinician = LogisticRegression(multi_class='multinomial', solver='lbfgs', max_iter=1000, random_state=42)
-clf_clinician.fit(train_data['states'], train_clinician_actions_discrete)
-train_acc_clinician = accuracy_score(train_clinician_actions_discrete, clf_clinician.predict(train_data['states']))
-test_acc_clinician = accuracy_score(test_clinician_actions_discrete, clf_clinician.predict(test_data['states']))
-print(f"   Train accuracy: {train_acc_clinician:.4f}")
-print(f"   Test accuracy:  {test_acc_clinician:.4f}")
+# ============================================================================
+# VP1 Classifiers (Binary: 0 or 1)
+# ============================================================================
+
+# 1. Train VP1 classifier for model actions
+print("\n1. Training VP1 classifier for model actions (2 classes: 0 or 1)...")
+clf_vp1_model = LogisticRegression(solver='lbfgs', max_iter=1000, random_state=42)
+clf_vp1_model.fit(train_data['states'], train_model_vp1.astype(int))
+train_acc_vp1_model = accuracy_score(train_model_vp1, clf_vp1_model.predict(train_data['states']))
+test_acc_vp1_model = accuracy_score(test_model_vp1, clf_vp1_model.predict(test_data['states']))
+print(f"   Train accuracy: {train_acc_vp1_model:.4f}")
+print(f"   Test accuracy:  {test_acc_vp1_model:.4f}")
+
+# 2. Train VP1 classifier for clinician actions
+print("\n2. Training VP1 classifier for clinician actions (2 classes: 0 or 1)...")
+clf_vp1_clinician = LogisticRegression(solver='lbfgs', max_iter=1000, random_state=42)
+clf_vp1_clinician.fit(train_data['states'], train_clinician_vp1.astype(int))
+train_acc_vp1_clinician = accuracy_score(train_clinician_vp1, clf_vp1_clinician.predict(train_data['states']))
+test_acc_vp1_clinician = accuracy_score(test_clinician_vp1, clf_vp1_clinician.predict(test_data['states']))
+print(f"   Train accuracy: {train_acc_vp1_clinician:.4f}")
+print(f"   Test accuracy:  {test_acc_vp1_clinician:.4f}")
+
+# ============================================================================
+# VP2 Regressors (Continuous: [0.0, 0.5])
+# ============================================================================
+
+# 3. Train VP2 regressor for model actions
+print("\n3. Training VP2 regressor for model actions (continuous [0.0, 0.5])...")
+reg_vp2_model = Ridge(alpha=1.0, random_state=42)
+reg_vp2_model.fit(train_data['states'], train_model_vp2)
+train_pred_vp2_model = reg_vp2_model.predict(train_data['states'])
+test_pred_vp2_model = reg_vp2_model.predict(test_data['states'])
+
+# Compute residual variance for Gaussian probability density
+train_residuals_vp2_model = train_model_vp2 - train_pred_vp2_model
+vp2_model_std = np.std(train_residuals_vp2_model)
+
+print(f"   Train RMSE: {np.sqrt(np.mean(train_residuals_vp2_model**2)):.4f}")
+print(f"   Test RMSE:  {np.sqrt(np.mean((test_model_vp2 - test_pred_vp2_model)**2)):.4f}")
+print(f"   Residual std: {vp2_model_std:.4f}")
+
+# 4. Train VP2 regressor for clinician actions
+print("\n4. Training VP2 regressor for clinician actions (continuous [0.0, 0.5])...")
+reg_vp2_clinician = Ridge(alpha=1.0, random_state=42)
+reg_vp2_clinician.fit(train_data['states'], train_clinician_vp2)
+train_pred_vp2_clinician = reg_vp2_clinician.predict(train_data['states'])
+test_pred_vp2_clinician = reg_vp2_clinician.predict(test_data['states'])
+
+# Compute residual variance for Gaussian probability density
+train_residuals_vp2_clinician = train_clinician_vp2 - train_pred_vp2_clinician
+vp2_clinician_std = np.std(train_residuals_vp2_clinician)
+
+print(f"   Train RMSE: {np.sqrt(np.mean(train_residuals_vp2_clinician**2)):.4f}")
+print(f"   Test RMSE:  {np.sqrt(np.mean((test_clinician_vp2 - test_pred_vp2_clinician)**2)):.4f}")
+print(f"   Residual std: {vp2_clinician_std:.4f}")
 
 # Get probabilities on test data
 print("\n" + "="*70)
 print("COMPUTING BEHAVIOR POLICY PROBABILITIES")
 print("="*70)
 
-# Model policy: π_model(a_clinician | s)
-test_probs_model = clf_model.predict_proba(test_data['states'])
-test_prob_model = test_probs_model[np.arange(len(test_clinician_actions_discrete)), test_clinician_actions_discrete.astype(int)]
+# ============================================================================
+# VP1 Probabilities (from logistic classifiers)
+# ============================================================================
 
-# Clinician policy: π_clinician(a_clinician | s)
-test_probs_clinician = clf_clinician.predict_proba(test_data['states'])
-test_prob_clinician = test_probs_clinician[np.arange(len(test_clinician_actions_discrete)), test_clinician_actions_discrete.astype(int)]
+# Model VP1 policy: π_model(VP1_clinician | s)
+test_probs_vp1_model = clf_vp1_model.predict_proba(test_data['states'])
+test_prob_vp1_model = test_probs_vp1_model[np.arange(len(test_clinician_vp1)), test_clinician_vp1.astype(int)]
 
-print(f"\nTest probability statistics:")
-print(f"  Model policy π(a_clinician|s)     - Mean: {test_prob_model.mean():.4f}, Std: {test_prob_model.std():.4f}, Min: {test_prob_model.min():.4f}, Max: {test_prob_model.max():.4f}")
-print(f"  Clinician policy π(a_clinician|s) - Mean: {test_prob_clinician.mean():.4f}, Std: {test_prob_clinician.std():.4f}, Min: {test_prob_clinician.min():.4f}, Max: {test_prob_clinician.max():.4f}")
+# Clinician VP1 policy: π_clinician(VP1_clinician | s)
+test_probs_vp1_clinician = clf_vp1_clinician.predict_proba(test_data['states'])
+test_prob_vp1_clinician = test_probs_vp1_clinician[np.arange(len(test_clinician_vp1)), test_clinician_vp1.astype(int)]
 
-print(f"\nSample probabilities (first 10 test transitions):")
-print(f"  Index | Model π | Clinician π | Ratio")
-print(f"  " + "-"*50)
-for i in range(min(10, len(test_prob_model))):
-    ratio = test_prob_model[i] / (test_prob_clinician[i] + 1e-10)
-    print(f"  {i:5d} | {test_prob_model[i]:.4f} | {test_prob_clinician[i]:.4f} | {ratio:.4f}") 
+print(f"\nVP1 probability statistics:")
+print(f"  Model π(VP1_clinician|s):     Mean={test_prob_vp1_model.mean():.4f}, Std={test_prob_vp1_model.std():.4f}")
+print(f"  Clinician π(VP1_clinician|s): Mean={test_prob_vp1_clinician.mean():.4f}, Std={test_prob_vp1_clinician.std():.4f}")
+
+# ============================================================================
+# VP2 Probability Densities (Gaussian assumption)
+# ============================================================================
+
+# Model VP2 policy: p_model(VP2_clinician | s) using Gaussian
+test_pred_vp2_model_test = reg_vp2_model.predict(test_data['states'])
+test_prob_vp2_model = norm.pdf(test_clinician_vp2, loc=test_pred_vp2_model_test, scale=vp2_model_std + 1e-6)
+
+# Clinician VP2 policy: p_clinician(VP2_clinician | s) using Gaussian
+test_pred_vp2_clinician_test = reg_vp2_clinician.predict(test_data['states'])
+test_prob_vp2_clinician = norm.pdf(test_clinician_vp2, loc=test_pred_vp2_clinician_test, scale=vp2_clinician_std + 1e-6)
+
+print(f"\nVP2 probability density statistics:")
+print(f"  Model p(VP2_clinician|s):     Mean={test_prob_vp2_model.mean():.4f}, Std={test_prob_vp2_model.std():.4f}")
+print(f"  Clinician p(VP2_clinician|s): Mean={test_prob_vp2_clinician.mean():.4f}, Std={test_prob_vp2_clinician.std():.4f}")
+
+# ============================================================================
+# Combined IS Weights: π(VP1) × p(VP2)
+# ============================================================================
+
+print("\n" + "="*70)
+print("COMPUTING IMPORTANCE SAMPLING WEIGHTS")
+print("="*70)
+
+# Set epsilon for numerical stability
+eps = 1e-10
+
+# IS weight = [π_model(VP1) × p_model(VP2)] / [π_clinician(VP1) × p_clinician(VP2)]
+is_weight_numerator = test_prob_vp1_model * test_prob_vp2_model
+is_weight_denominator = test_prob_vp1_clinician * test_prob_vp2_clinician
+is_weight = is_weight_numerator / (is_weight_denominator + eps)
+
+print(f"\nIS weight statistics:")
+print(f"  Mean: {is_weight.mean():.4f}, Std: {is_weight.std():.4f}")
+print(f"  Min: {is_weight.min():.4f}, Max: {is_weight.max():.4f}")
+
+print(f"\nSample probabilities (first 5 test transitions):")
+print(f"  Index | VP1_model | VP1_clin | VP2_model | VP2_clin | IS_weight")
+print(f"  " + "-"*80)
+for i in range(min(5, len(is_weight))):
+    print(f"  {i:5d} | {test_prob_vp1_model[i]:9.4f} | {test_prob_vp1_clinician[i]:8.4f} | "
+          f"{test_prob_vp2_model[i]:9.4f} | {test_prob_vp2_clinician[i]:8.4f} | {is_weight[i]:9.4f}") 
 
 
 # Finally for each of the transitions (indices) in the test data, compute pi_lg_vp1_ma(s) / (eps + pi_lg_vp1_ca(s)) * pi_sm_vp2_ma(s) / (esp + pi_sm_vp2_ca(s)) * R where R is the reward on that transition index or state, this is the expected reward using the model actions on that state
@@ -242,9 +364,10 @@ print("="*70)
 # Set epsilon for numerical stability
 eps = 1e-10
 
-# Compute importance sampling weights (single ratio, no chain rule!)
-# IS_weight = π_model(a_clinician|s) / π_clinician(a_clinician|s)
-is_weight = test_prob_model / (test_prob_clinician + eps)
+# IS weight = [π_model(VP1) × p_model(VP2)] / [π_clinician(VP1) × p_clinician(VP2)]
+is_weight_numerator = test_prob_vp1_model * test_prob_vp2_model
+is_weight_denominator = test_prob_vp1_clinician * test_prob_vp2_clinician
+is_weight = is_weight_numerator / (is_weight_denominator + eps)
 
 isw_ci_diff_lower = np.percentile(is_weight, 2.5)
 isw_ci_diff_upper = np.percentile(is_weight, 97.5)
