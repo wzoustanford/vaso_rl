@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from typing import Dict, Tuple
 import os
-import sys
+import sys, pdb
 from datetime import datetime
 
 # Import the shared continuous Q-network from train_cql_stable
@@ -213,7 +213,7 @@ class BinaryCQL:
             actions = actions.unsqueeze(1)
         
         # Clip rewards for stability
-        rewards = torch.clamp(rewards, -10, 10)
+        #rewards = torch.clamp(rewards, -10, 10)
         
         # Compute target Q-values
         with torch.no_grad():
@@ -227,7 +227,7 @@ class BinaryCQL:
             
             # Compute targets
             target_q = rewards + self.gamma * next_q * (1 - dones)
-            target_q = torch.clamp(target_q, -50, 50)
+            #target_q = torch.clamp(target_q, -50, 50)
         
         # Update Q1
         current_q1 = self.q1(states, actions).squeeze()

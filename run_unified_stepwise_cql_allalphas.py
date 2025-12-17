@@ -25,7 +25,7 @@ import sys
 import pdb
 
 # Import our unified pipeline
-from integrated_data_pipeline_v2_simple_reward import IntegratedDataPipelineV2
+from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
 
 # Force unbuffered output
 sys.stdout = sys.__stdout__
@@ -560,7 +560,7 @@ def train_unified_stepwise_cql(alpha=0.001, max_step=0.1):
     )
     
     # Training loop
-    epochs = 100  # Reduced for testing
+    epochs = 500  # Reduced for testing
     batch_size = 128
     print(f"\nTraining for {epochs} epochs with batch size {batch_size}...", flush=True)
     start_time = time.time()

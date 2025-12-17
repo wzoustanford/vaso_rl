@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-LSTM Block Discrete CQL Training Script with Norepinephrine as Action
-======================================================================
-Trains LSTM CQL with discrete dosing levels for Norepinephrine.
+LSTM Block Discrete CQL Training Script with VP1 x VP2 Action Space
+====================================================================
+Trains LSTM CQL with discrete action space:
+- VP1: Binary vasopressin (0 or 1)
+- VP2: Discretized norepinephrine (N bins from 0 to 0.5 mcg/kg/min)
 """
 
 import numpy as np
@@ -15,7 +17,7 @@ from datetime import datetime
 from typing import Dict, Tuple
 
 # Import our components
-from integrated_data_pipeline_v2_simple_reward import IntegratedDataPipelineV2
+from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
 from medical_sequence_buffer import MedicalSequenceBuffer, SequenceDataLoader
 from lstm_block_discrete_cql_network import LSTMBlockDiscreteCQL
 from fqe_gaussian_analysis import FQEGaussianAnalysis, save_histogram_plot, save_q_values_to_pickle
@@ -108,7 +110,7 @@ def evaluate_lstm_cql(
 
 def train_lstm_block_discrete_cql(
     alpha: float = 0.0,
-    vp2_bins: int = 5,  # Number of discrete bins for Norepinephrine
+    vp2_bins: int = 5,  # Number of discrete bins for VP2 (Norepinephrine)
     sequence_length: int = 20,
     burn_in_length: int = 8,
     overlap: int = 10,
@@ -127,7 +129,9 @@ def train_lstm_block_discrete_cql(
     log_every: int = 1  # Log every epoch
 ):
     """
-    Train LSTM-based Block Discrete CQL with Norepinephrine as discrete action.
+    Train LSTM-based Block Discrete CQL with VP1 x VP2 discrete action space.
+    VP1: Binary vasopressin (0 or 1)
+    VP2: Discretized norepinephrine into bins (0 to 0.5 mcg/kg/min)
     """
     # Create directories
     os.makedirs(save_dir, exist_ok=True)
@@ -183,24 +187,40 @@ def train_lstm_block_discrete_cql(
     # State dimension is without norepinephrine (since it's now an action)
     state_dim = train_data['states'].shape[1]
     
-    # Define discrete action bins for Norepinephrine (aligned with block discrete CQL)
-    # Create evenly spaced bins from 0 to 0.5 mcg/kg/min
+    # Define discrete action bins for VP1 x VP2 (aligned with block discrete CQL)
+    # VP1: Binary (0 or 1)
+    # VP2: Discretized into bins from 0 to 0.5 mcg/kg/min
     vp2_bin_edges = np.linspace(0, 0.5, vp2_bins + 1)
     vp2_bin_centers = (vp2_bin_edges[:-1] + vp2_bin_edges[1:]) / 2
-    num_actions = vp2_bins
+    num_actions = 2 * vp2_bins  # VP1 (2 options) x VP2 (vp2_bins)
     
-    # Helper function to convert continuous doses to discrete indices
-    def continuous_to_discrete(continuous_doses):
-        """Convert continuous doses to discrete action indices."""
-        # Use np.digitize with bin edges, then clip to valid range
-        action_indices = np.digitize(continuous_doses, vp2_bin_edges) - 1
-        return np.clip(action_indices, 0, num_actions - 1)
+    # Helper function to convert continuous [vp1, vp2] to discrete action index
+    def continuous_to_discrete_action(continuous_action):
+        """
+        Convert continuous action [vp1, vp2] to discrete action index.
+
+        Args:
+            continuous_action: [vp1, vp2] where vp1 is binary (0 or 1), vp2 is continuous
+
+        Returns:
+            action_idx: discrete action index (0 to num_actions-1)
+        """
+        vp1, vp2 = continuous_action
+        vp1_idx = int(vp1)  # 0 or 1
+
+        # Find which bin vp2 falls into
+        vp2_bin = np.digitize(vp2, vp2_bin_edges) - 1
+        vp2_bin = np.clip(vp2_bin, 0, vp2_bins - 1)
+
+        # Combine into single action index: action_idx = vp1_idx * vp2_bins + vp2_bin
+        action_idx = vp1_idx * vp2_bins + vp2_bin
+        return action_idx
     
     # Print configuration
     logger.log("\n" + "="*70)
     logger.log("CONFIGURATION:")
     logger.log(f"  State dimension: {state_dim}")
-    logger.log(f"  Action dimension: {num_actions} discrete levels")
+    logger.log(f"  Action space: VP1 (binary) x VP2 ({vp2_bins} bins) = {num_actions} total discrete actions")
     logger.log(f"  VP2 bin edges: {vp2_bin_edges}")
     logger.log(f"  VP2 bin centers: {vp2_bin_centers}")
     logger.log(f"  Sequence length: {sequence_length}")
@@ -241,11 +261,11 @@ def train_lstm_block_discrete_cql(
     logger.log("Generating training sequences...")
     for patient_id, (start_idx, end_idx) in pipeline.train_patient_groups.items():
         for t in range(start_idx, end_idx):
-            # Convert continuous norepinephrine dose to discrete action index
-            # In dual mode, actions are [vp1, vp2] where vp2 is norepinephrine
-            continuous_dose = train_data['actions'][t, 1] if train_data['actions'].ndim > 1 else train_data['actions'][t]
-            action_idx = continuous_to_discrete(np.array([continuous_dose]))[0]
-            
+            # Convert continuous [vp1, vp2] action to discrete action index
+            # In dual mode, actions are [vp1, vp2] where vp1 is vasopressin, vp2 is norepinephrine
+            continuous_action = train_data['actions'][t]  # [vp1, vp2]
+            action_idx = continuous_to_discrete_action(continuous_action)
+
             train_buffer.add_transition(
                 state=train_data['states'][t],
                 action=np.array([action_idx]),  # Store as discrete action index
@@ -261,10 +281,11 @@ def train_lstm_block_discrete_cql(
     logger.log("Generating validation sequences...")
     for patient_id, (start_idx, end_idx) in pipeline.val_patient_groups.items():
         for t in range(start_idx, end_idx):
-            # Convert continuous norepinephrine dose to discrete action index
-            continuous_dose = val_data['actions'][t, 1] if val_data['actions'].ndim > 1 else val_data['actions'][t]
-            action_idx = continuous_to_discrete(np.array([continuous_dose]))[0]
-            
+            # Convert continuous [vp1, vp2] action to discrete action index
+            # In dual mode, actions are [vp1, vp2] where vp1 is vasopressin, vp2 is norepinephrine
+            continuous_action = val_data['actions'][t]  # [vp1, vp2]
+            action_idx = continuous_to_discrete_action(continuous_action)
+
             val_buffer.add_transition(
                 state=val_data['states'][t],
                 action=np.array([action_idx]),  # Store as discrete action index
@@ -446,7 +467,7 @@ def train_lstm_block_discrete_cql(
         alpha_str = f"{alpha:.1e}".replace('.', 'p').replace('-', 'm')
     else:
         alpha_str = f"{alpha:.4f}"
-    final_save_path = os.path.join(save_dir, f'lstm_block_discrete_cql_alpha{alpha_str}_bins{vp2_bins}_hdim{hidden_dim}_seql{sequence_length}_final.pt')
+    final_save_path = os.path.join(save_dir, f'lstm_bd_cql_vp12_alpha{alpha_str}_bins{vp2_bins}_hdim{hidden_dim}_seql{sequence_length}_final.pt')
     torch.save({
         'q1_state_dict': agent.q1.state_dict(),
         'q2_state_dict': agent.q2.state_dict(),
@@ -494,17 +515,17 @@ def main():
     agent, train_buffer, val_buffer, history = train_lstm_block_discrete_cql(
         alpha=0.0,
         vp2_bins=10,  # 5 discrete dosing levels for Norepinephrine (aligned with block discrete CQL)
-        sequence_length=20,
-        burn_in_length=8,
-        overlap=10,
+        sequence_length=5,
+        burn_in_length=2,
+        overlap=2,
         hidden_dim=64,
         lstm_hidden=64,
         num_lstm_layers=2,
         batch_size=32,
-        epochs=200,  # Full 100 epochs
+        epochs=500,  # Full 100 epochs
         learning_rate=1e-3,
-        tau=0.95,
-        gamma=0.99,
+        tau=0.8,
+        gamma=0.95,
         grad_clip=1.0,
         buffer_capacity=50000,
         log_every=1  # Log every epoch

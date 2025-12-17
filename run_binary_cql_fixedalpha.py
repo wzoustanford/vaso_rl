@@ -16,7 +16,7 @@ import os
 import sys
 
 # Import our unified pipeline and models
-from integrated_data_pipeline_v2_simple_reward import IntegratedDataPipelineV2
+from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
 from train_binary_cql import BinaryCQL
 
 # Force unbuffered output
@@ -52,15 +52,15 @@ def train_binary_cql():
     # Initialize agent with specified parameters
     agent = BinaryCQL(
         state_dim=state_dim,
-        alpha=0.0,  
-        gamma=0.99,   
-        tau=0.95,      # As specified
+        alpha=0.0,
+        gamma=0.95,
+        tau=0.8,      # As specified
         lr=1e-3,      # As specified  
         grad_clip=1.0
     )
     
     # Training loop
-    epochs = 100
+    epochs = 500
     batch_size = 128
     print(f"\nTraining for {epochs} epochs with batch size {batch_size}...", flush=True)
     start_time = time.time()

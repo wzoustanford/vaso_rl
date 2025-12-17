@@ -22,7 +22,7 @@ import os
 import sys
 
 # Import our unified pipeline
-from integrated_data_pipeline_v2_simple_reward import IntegratedDataPipelineV2
+from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
 
 # Force unbuffered output
 sys.stdout = sys.__stdout__
@@ -335,9 +335,6 @@ def train_block_discrete_cql(alpha: float = 0.001, vp2_bins: int = 5):
     # Get state dimension
     state_dim = train_data['states'].shape[1]
 
-    # Enter Tau value here
-    tau = 0.95
-
     # Print settings
     print("\n" + "="*70, flush=True)
     print("SETTINGS:", flush=True)
@@ -345,7 +342,7 @@ def train_block_discrete_cql(alpha: float = 0.001, vp2_bins: int = 5):
     print(f"  Action dimension: 2 (VP1: binary, VP2: {vp2_bins} bins)", flush=True)
     print(f"  Total discrete actions: {2 * vp2_bins}", flush=True)
     print(f"  ALPHA = {alpha}", flush=True)
-    print(f"  TAU = {tau} (target network update)", flush=True)
+    print(f"  TAU = 0.8 (target network update)", flush=True)
     print("  LR = 0.001 (learning rate)", flush=True)
     print("  BATCH_SIZE = 128", flush=True)
     print("  EPOCHS = 100", flush=True)
@@ -356,14 +353,14 @@ def train_block_discrete_cql(alpha: float = 0.001, vp2_bins: int = 5):
         state_dim=state_dim,
         vp2_bins=vp2_bins,
         alpha=alpha,
-        gamma=0.99,
-        tau=tau,      # As specified
+        gamma=0.95,
+        tau=0.8,      # As specified
         lr=1e-3,      # As specified  
         grad_clip=1.0
     )
     
     # Training loop
-    epochs = 100
+    epochs = 500
     batch_size = 128
     print(f"\nTraining for {epochs} epochs with batch size {batch_size}...", flush=True)
     start_time = time.time()

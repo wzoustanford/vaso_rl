@@ -21,7 +21,7 @@ import os
 import sys
 
 # Import our unified pipeline
-from integrated_data_pipeline_v2_simple_reward import IntegratedDataPipelineV2
+from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
 
 # Force unbuffered output
 sys.stdout = sys.__stdout__
@@ -262,14 +262,14 @@ def train_dual_mixed_cql(alpha=0.001):
     agent = DualMixedCQL(
         state_dim=state_dim,
         alpha=alpha,  # CQL penalty parameter
-        gamma=0.99,
-        tau=0.95,      # As specified
+        gamma=0.95,
+        tau=0.8,      # As specified
         lr=1e-3,      # As specified
         grad_clip=1.0
     )
     
     # Training loop
-    epochs = 100
+    epochs = 500
     batch_size = 128
     print(f"\nTraining for {epochs} epochs with batch size {batch_size}...", flush=True)
     start_time = time.time()
