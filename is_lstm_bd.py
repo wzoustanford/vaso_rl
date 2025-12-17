@@ -13,7 +13,7 @@ warnings.filterwarnings('ignore')
 # Import project modules
 from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
 
-# number of bins 
+#[C-change: LSTM block discrete network 10 bins]
 n_bins = 10
 
 # Define constants
@@ -25,34 +25,57 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
 # Import the network class from the training script
-from run_block_discrete_cql_allalphas import DualBlockDiscreteQNetwork
+#from run_block_discrete_cql_allalphas import DualBlockDiscreteQNetwork
+from lstm_block_discrete_cql_network import LSTMBlockDiscreteCQL #[C-change] imported the network 
 
-# Model parameters
-n_actions = 2 * n_bins  # VP1 (2 options: 0,1) x VP2 (5 bins) = 10 total actions
+# Model parameters - exactly matching run_lstm_block_discrete_cql_with_logging.py
+# LSTM model now handles joint VP1×VP2 action space
+n_actions = 2 * n_bins  # VP1 (binary) × VP2 (n_bins) = 20 total discrete actions
 state_dim = STATE_DIM  # 17 features
+hidden_dim = 64  # Exact match from training script
+lstm_hidden = 64  # Exact match from training script
+num_lstm_layers = 2  # Exact match from training script
 
-# Initialize Q-networks (we use both Q1 and Q2, then take min)
-q1_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
-q2_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
+# Define VP2 bin edges for discretization
+vp2_bin_edges = np.linspace(0, 0.5, n_bins + 1)
+vp2_bin_centers = (vp2_bin_edges[:-1] + vp2_bin_edges[1:]) / 2
+
+# Initialize LSTM CQL agent (contains both Q1 and Q2 networks internally)
+agent = LSTMBlockDiscreteCQL(
+    state_dim=state_dim,
+    num_actions=n_actions,  # 20 joint VP1×VP2 actions
+    action_bins=vp2_bin_centers,  # VP2 bin centers
+    hidden_dim=hidden_dim,
+    lstm_hidden=lstm_hidden,
+    num_lstm_layers=num_lstm_layers,
+    alpha=0.0,  # Exact match
+    gamma=0.95,  # Exact match
+    tau=0.8,  # As requested
+    lr=1e-3,  # Exact match
+    device=device
+)
 
 # Load the trained model checkpoint
-
-#[C-change: please make this selectable from a list of pre-trained models]
-model_path = f'experiment/epoch500_new_trained_oviss_reward_models/block_discrete_cql_alpha0.0000_bins{n_bins}_final.pt'
+model_path = f'experiment/epoch500_new_trained_oviss_reward_models/lstm_block_discrete_cql_alpha0.0_bins{n_bins}_hdim{hidden_dim}_seql5_best.pt'
 
 checkpoint = torch.load(model_path, map_location=device)
-q1_network.load_state_dict(checkpoint['q1_state_dict'])
-q2_network.load_state_dict(checkpoint['q2_state_dict'])
-q1_network.eval()
-q2_network.eval()
+agent.q1.load_state_dict(checkpoint['q1_state_dict'])
+agent.q2.load_state_dict(checkpoint['q2_state_dict'])
+agent.q1.eval()
+agent.q2.eval()
 
 print(f"Loaded model from: {model_path}")
 print(f"State dimension: {state_dim}")
-print(f"Number of actions: {n_actions} (VP1: 2 binary × VP2: {n_bins} bins)")
+print(f"Action space: VP1 (binary) × VP2 ({n_bins} bins) = {n_actions} total discrete actions")
+print(f"VP2 bin edges: {vp2_bin_edges}")
+print(f"VP2 bin centers: {vp2_bin_centers}")
+print(f"LSTM config: hidden_dim={hidden_dim}, lstm_hidden={lstm_hidden}, layers={num_lstm_layers}")
 print("Using min(Q1, Q2) for action selection (double Q-learning)") 
 
 ###
-# prepare and load the data with random seed 42 
+# prepare and load the data with random seed 42 with all the data in a sequence, for example:
+# pipeline = IntegratedDataPipelineV2(model_type='dual', random_seed=42)
+# train_data, val_data, test_data = pipeline.prepare_data()
 
 print("\n" + "="*70)
 print("LOADING DATA")
@@ -84,6 +107,7 @@ print(f"  States:  {train_data['states'].shape}")
 print(f"  Actions: {train_data['actions'].shape}")
 print(f"  Rewards: {train_data['rewards'].shape}")
 
+
 ## use the trained model to predict the optimal actions predicted by the model
 ## for example to get model actions: model_actions = model.select_action(states)
 ## for example to get clinician actions: clinician_actions = data.actions
@@ -97,64 +121,123 @@ print("="*70)
 vp2_bin_edges = np.linspace(0, 0.5, n_bins + 1)
 print(f"VP2 bin edges: {vp2_bin_edges}")
 
-# Helper function to select actions and return DISCRETE indices (0-9)
-def select_action_batch_discrete(states, q1_net, q2_net, vp2_bins, device):
+# Helper function to select actions for patient trajectories using LSTM
+def select_actions_for_patient_trajectory(
+    trajectory_states,
+    agent,
+    n_actions,
+    sequence_length=5,
+    device='cpu'
+):
     """
-    Select best actions for a batch of states using min(Q1, Q2)
-    Returns: numpy array of discrete action indices [0-9]
+    Select best VP2 actions for an entire patient trajectory using LSTM.
+    Processes trajectory in chunks of sequence_length for LSTM.
+
+    Args:
+        trajectory_states: [trajectory_len, state_dim] - all states for one patient
+        agent: LSTMBlockDiscreteCQL agent with q1, q2 networks
+        n_actions: Number of discrete VP2 actions (10)
+        sequence_length: LSTM sequence length (5)
+        device: torch device
+
+    Returns:
+        action_indices: [trajectory_len] - discrete VP2 action indices (0-9)
     """
     with torch.no_grad():
-        if states.ndim == 1:
-            states = states.reshape(1, -1)
+        trajectory_len = trajectory_states.shape[0]
+        all_actions = []
 
-        batch_size = states.shape[0]
-        state_tensor = torch.FloatTensor(states).to(device)
+        # Process trajectory in chunks of sequence_length
+        for start_idx in range(0, trajectory_len, sequence_length):
+            end_idx = min(start_idx + sequence_length, trajectory_len)
+            chunk_states = trajectory_states[start_idx:end_idx]
+            chunk_len = end_idx - start_idx
 
-        # Create all possible discrete actions for each state in batch
-        total_actions = 2 * vp2_bins  # 10 actions
-        all_actions = torch.arange(total_actions).to(device)
-        all_actions = all_actions.unsqueeze(0).expand(batch_size, -1)
+            # Convert to [1, chunk_len, state_dim]
+            states_tensor = torch.FloatTensor(chunk_states).unsqueeze(0).to(device)
 
-        # Expand states to match actions
-        state_expanded = state_tensor.unsqueeze(1).expand(-1, total_actions, -1)
-        state_expanded = state_expanded.reshape(-1, state_dim)
-        actions_flat = all_actions.reshape(-1)
+            # Initialize hidden states for this chunk
+            hidden1 = agent.q1.init_hidden(1, device)
+            hidden2 = agent.q2.init_hidden(1, device)
 
-        # Compute Q-values for all actions
-        q1_values = q1_net(state_expanded, actions_flat).reshape(batch_size, total_actions)
-        q2_values = q2_net(state_expanded, actions_flat).reshape(batch_size, total_actions)
-        q_values = torch.min(q1_values, q2_values)
+            # Get Q-values for all actions
+            q1_all, _ = agent.q1.forward(states_tensor, hidden1)
+            q2_all, _ = agent.q2.forward(states_tensor, hidden2)
 
-        # Get best action indices (0-9)
-        best_action_indices = q_values.argmax(dim=1).cpu().numpy()
+            # Take min of Q1 and Q2 (double Q-learning)
+            q_values = torch.min(q1_all, q2_all)  # [1, chunk_len, n_actions]
 
-        return best_action_indices
+            # Select best action for each timestep
+            best_actions = q_values.argmax(dim=-1).squeeze(0).cpu().numpy()  # [chunk_len]
+
+            all_actions.append(best_actions)
+
+        # Concatenate all chunks
+        return np.concatenate(all_actions)
 
 # Helper function to convert continuous actions to discrete indices
-def continuous_to_discrete_action(actions, vp2_edges, vp2_bins):
+def continuous_to_discrete_action(actions, vp2_edges, n_bins):
     """
-    Convert continuous actions [vp1, vp2] to discrete action indices (0-9)
-    action_idx = vp1 * n_bins + vp2_bin
+    Convert continuous joint actions [VP1, VP2] to discrete indices (0-19).
+
+    Joint action encoding: action_idx = VP1 * n_bins + VP2_bin
+    - VP1 ∈ {0, 1} (binary)
+    - VP2_bin ∈ {0, 1, ..., 9} (10 bins)
+
+    Args:
+        actions: [batch_size, 2] where actions[:, 0]=VP1, actions[:, 1]=VP2
+        vp2_edges: VP2 bin edges for discretization
+        n_bins: Number of VP2 bins (10)
+
+    Returns:
+        action_indices: [batch_size] discrete indices in [0, 19]
     """
     vp1 = actions[:, 0].astype(int)  # Binary 0 or 1
-    vp2 = actions[:, 1].clip(0, 0.5)
+    vp2 = actions[:, 1]
 
-    # Convert VP2 continuous to bin index
+    # Convert VP2 continuous to bin index (0 to 9)
     vp2_bins_idx = np.digitize(vp2, vp2_edges) - 1
-    vp2_bins_idx = np.clip(vp2_bins_idx, 0, len(vp2_edges) - 2)
+    vp2_bins_idx = np.clip(vp2_bins_idx, 0, n_bins - 1)
 
-    # Combine: action_idx = vp1 * n_bins + vp2_bin
-    action_indices = vp1 * vp2_bins + vp2_bins_idx
+    # Combine into joint action: action_idx = VP1 * n_bins + VP2_bin
+    action_indices = vp1 * n_bins + vp2_bins_idx
+
     return action_indices
 
-# Get model actions as discrete indices (0-9)
-print("Computing model actions (discrete) for training data...")
-train_model_actions_discrete = select_action_batch_discrete(train_data['states'], q1_network, q2_network, n_bins, device)
+# Get model actions as discrete VP2 indices (0-9) - trajectory level processing
+print("Computing model VP2 actions (discrete) for training data...")
+train_model_actions_discrete = []
+for patient_id, (start_idx, end_idx) in pipeline.train_patient_groups.items():
+    patient_states = train_data['states'][start_idx:end_idx]
 
-print("Computing model actions (discrete) for test data...")
-test_model_actions_discrete = select_action_batch_discrete(test_data['states'], q1_network, q2_network, n_bins, device)
+    patient_model_actions = select_actions_for_patient_trajectory(
+        patient_states,
+        agent,
+        n_actions,
+        sequence_length=5,
+        device=device
+    )
+    train_model_actions_discrete.append(patient_model_actions)
 
-# Convert clinician continuous actions to discrete indices (0-9)
+train_model_actions_discrete = np.concatenate(train_model_actions_discrete)
+
+print("Computing model VP2 actions (discrete) for test data...")
+test_model_actions_discrete = []
+for patient_id, (start_idx, end_idx) in pipeline.test_patient_groups.items():
+    patient_states = test_data['states'][start_idx:end_idx]
+
+    patient_model_actions = select_actions_for_patient_trajectory(
+        patient_states,
+        agent,
+        n_actions,
+        sequence_length=5,
+        device=device
+    )
+    test_model_actions_discrete.append(patient_model_actions)
+
+test_model_actions_discrete = np.concatenate(test_model_actions_discrete)
+
+# Convert clinician continuous actions to discrete indices (0-19)
 train_clinician_actions_discrete = continuous_to_discrete_action(train_data['actions'], vp2_bin_edges, n_bins)
 test_clinician_actions_discrete = continuous_to_discrete_action(test_data['actions'], vp2_bin_edges, n_bins)
 
@@ -187,8 +270,8 @@ print("\n" + "="*70)
 print("TRAINING BEHAVIOR POLICY CLASSIFIERS (JOINT ACTION SPACE)")
 print("="*70)
 
-# Train softmax classifier for model actions (0-9)
-print("\n1. Training softmax classifier for model actions (10 classes)...")
+# Train softmax classifier for model actions (joint VP1×VP2: 0-19)
+print(f"\n1. Training softmax classifier for model actions ({n_actions} classes)...")
 clf_model = LogisticRegression(multi_class='multinomial', solver='lbfgs', max_iter=1000, random_state=42)
 clf_model.fit(train_data['states'], train_model_actions_discrete)
 train_acc_model = accuracy_score(train_model_actions_discrete, clf_model.predict(train_data['states']))
@@ -196,8 +279,8 @@ test_acc_model = accuracy_score(test_model_actions_discrete, clf_model.predict(t
 print(f"   Train accuracy: {train_acc_model:.4f}")
 print(f"   Test accuracy:  {test_acc_model:.4f}")
 
-# Train softmax classifier for clinician actions (0-9)
-print("\n2. Training softmax classifier for clinician actions (10 classes)...")
+# Train softmax classifier for clinician actions (joint VP1×VP2: 0-19)
+print(f"\n2. Training softmax classifier for clinician actions ({n_actions} classes)...")
 clf_clinician = LogisticRegression(multi_class='multinomial', solver='lbfgs', max_iter=1000, random_state=42)
 clf_clinician.fit(train_data['states'], train_clinician_actions_discrete)
 train_acc_clinician = accuracy_score(train_clinician_actions_discrete, clf_clinician.predict(train_data['states']))
@@ -210,11 +293,16 @@ print("\n" + "="*70)
 print("COMPUTING BEHAVIOR POLICY PROBABILITIES")
 print("="*70)
 
-# Model policy: π_model(a_clinician | s)
+print(f"\nWorking with joint VP1×VP2 action space:")
+print(f"  Action range: [0, {n_actions-1}]")
+print(f"  Sample clinician actions (first 5): {test_clinician_actions_discrete[:5]}")
+
+# Model policy: π_model(a_joint_clinician | s)
+# Both model and clinician actions are now in joint VP1×VP2 space (0-19)
 test_probs_model = clf_model.predict_proba(test_data['states'])
 test_prob_model = test_probs_model[np.arange(len(test_clinician_actions_discrete)), test_clinician_actions_discrete.astype(int)]
 
-# Clinician policy: π_clinician(a_clinician | s)
+# Clinician policy: π_clinician(a_joint_clinician | s)
 test_probs_clinician = clf_clinician.predict_proba(test_data['states'])
 test_prob_clinician = test_probs_clinician[np.arange(len(test_clinician_actions_discrete)), test_clinician_actions_discrete.astype(int)]
 

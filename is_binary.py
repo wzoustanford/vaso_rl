@@ -13,52 +13,49 @@ warnings.filterwarnings('ignore')
 # Import project modules
 from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
 
-# number of bins 
-n_bins = 10
-
-# Define constants
-STATE_DIM = 17  # 17 state features for dual model
-
-### define the block discrete model
-# - load the trained block discrete model
+### define the binary CQL model
+# - load the trained binary CQL model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-# Import the network class from the training script
-from run_block_discrete_cql_allalphas import DualBlockDiscreteQNetwork
+# Import the BinaryCQL class from the training script
+from train_binary_cql import BinaryCQL
 
 # Model parameters
-n_actions = 2 * n_bins  # VP1 (2 options: 0,1) x VP2 (5 bins) = 10 total actions
-state_dim = STATE_DIM  # 17 features
+n_actions = 2  # Binary actions: 0 or 1 for VP1
+state_dim = 17  # 18 state features for binary CQL (includes VP2 as a state feature)
 
-# Initialize Q-networks (we use both Q1 and Q2, then take min)
-q1_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
-q2_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
+# Initialize BinaryCQL agent
+binary_agent = BinaryCQL(
+    state_dim=state_dim,
+    alpha=0.0,
+    gamma=0.99,
+    tau=0.08,
+    lr=1e-3,
+    device=device
+)
 
 # Load the trained model checkpoint
-
-#[C-change: please make this selectable from a list of pre-trained models]
-model_path = f'experiment/epoch500_new_trained_oviss_reward_models/block_discrete_cql_alpha0.0000_bins{n_bins}_final.pt'
+model_path = 'experiment/binary_vp1_only/binary_cql_unified_alpha00_final.pt'
 
 checkpoint = torch.load(model_path, map_location=device)
-q1_network.load_state_dict(checkpoint['q1_state_dict'])
-q2_network.load_state_dict(checkpoint['q2_state_dict'])
-q1_network.eval()
-q2_network.eval()
+binary_agent.q1.load_state_dict(checkpoint['q1_state_dict'])
+binary_agent.q2.load_state_dict(checkpoint['q2_state_dict'])
+binary_agent.q1.eval()
+binary_agent.q2.eval()
 
 print(f"Loaded model from: {model_path}")
 print(f"State dimension: {state_dim}")
-print(f"Number of actions: {n_actions} (VP1: 2 binary × VP2: {n_bins} bins)")
+print(f"Number of actions: {n_actions} (VP1 binary: 0 or 1)")
 print("Using min(Q1, Q2) for action selection (double Q-learning)") 
 
 ###
-# prepare and load the data with random seed 42 
+# prepare and load the data with random seed 42 with all the data in a sequence 
 
 print("\n" + "="*70)
 print("LOADING DATA")
 print("="*70)
 
-# Initialize data pipeline with random seed 42
 pipeline = IntegratedDataPipelineV2(model_type='dual', random_seed=42)
 train_data, val_data, test_data = pipeline.prepare_data()
 
@@ -84,24 +81,22 @@ print(f"  States:  {train_data['states'].shape}")
 print(f"  Actions: {train_data['actions'].shape}")
 print(f"  Rewards: {train_data['rewards'].shape}")
 
+
 ## use the trained model to predict the optimal actions predicted by the model
-## for example to get model actions: model_actions = model.select_action(states)
-## for example to get clinician actions: clinician_actions = data.actions
-## note the resulting action should have both vp1 action and vp2 action
 
 print("\n" + "="*70)
 print("GENERATING MODEL ACTIONS")
 print("="*70)
 
-# Define VP2 bin edges (exactly as in training script)
-vp2_bin_edges = np.linspace(0, 0.5, n_bins + 1)
-print(f"VP2 bin edges: {vp2_bin_edges}")
+# For binary QL, VP2 is Not part of the state, nor the action
+# Actions are simply binary: 0 or 1
+print(f"Binary actions: 0 or 1 (VP1 only)")
 
-# Helper function to select actions and return DISCRETE indices (0-9)
-def select_action_batch_discrete(states, q1_net, q2_net, vp2_bins, device):
+# Helper function to select binary actions and return values (0 or 1)
+def select_action_batch_binary(states, agent, device):
     """
-    Select best actions for a batch of states using min(Q1, Q2)
-    Returns: numpy array of discrete action indices [0-9]
+    Select best binary actions for a batch of states using min(Q1, Q2)
+    Returns: numpy array of binary actions [0 or 1]
     """
     with torch.no_grad():
         if states.ndim == 1:
@@ -110,98 +105,76 @@ def select_action_batch_discrete(states, q1_net, q2_net, vp2_bins, device):
         batch_size = states.shape[0]
         state_tensor = torch.FloatTensor(states).to(device)
 
-        # Create all possible discrete actions for each state in batch
-        total_actions = 2 * vp2_bins  # 10 actions
-        all_actions = torch.arange(total_actions).to(device)
-        all_actions = all_actions.unsqueeze(0).expand(batch_size, -1)
+        # Create action tensors for both possible actions (0 and 1)
+        actions_0 = torch.zeros(batch_size, 1).to(device)
+        actions_1 = torch.ones(batch_size, 1).to(device)
 
-        # Expand states to match actions
-        state_expanded = state_tensor.unsqueeze(1).expand(-1, total_actions, -1)
-        state_expanded = state_expanded.reshape(-1, state_dim)
-        actions_flat = all_actions.reshape(-1)
+        # Evaluate Q-values for action=0
+        q1_values_0 = agent.q1(state_tensor, actions_0).squeeze()
+        q2_values_0 = agent.q2(state_tensor, actions_0).squeeze()
+        q_values_0 = torch.min(q1_values_0, q2_values_0)
 
-        # Compute Q-values for all actions
-        q1_values = q1_net(state_expanded, actions_flat).reshape(batch_size, total_actions)
-        q2_values = q2_net(state_expanded, actions_flat).reshape(batch_size, total_actions)
-        q_values = torch.min(q1_values, q2_values)
+        # Evaluate Q-values for action=1
+        q1_values_1 = agent.q1(state_tensor, actions_1).squeeze()
+        q2_values_1 = agent.q2(state_tensor, actions_1).squeeze()
+        q_values_1 = torch.min(q1_values_1, q2_values_1)
 
-        # Get best action indices (0-9)
-        best_action_indices = q_values.argmax(dim=1).cpu().numpy()
+        # Select best action for each state (argmax: 0 or 1)
+        best_actions = (q_values_1 > q_values_0).float().cpu().numpy()
 
-        return best_action_indices
+        return best_actions
 
-# Helper function to convert continuous actions to discrete indices
-def continuous_to_discrete_action(actions, vp2_edges, vp2_bins):
-    """
-    Convert continuous actions [vp1, vp2] to discrete action indices (0-9)
-    action_idx = vp1 * n_bins + vp2_bin
-    """
-    vp1 = actions[:, 0].astype(int)  # Binary 0 or 1
-    vp2 = actions[:, 1].clip(0, 0.5)
+# Get model binary actions (0 or 1)
+print("Computing model binary actions for training data...")
+train_model_actions_binary = select_action_batch_binary(train_data['states'], binary_agent, device)
 
-    # Convert VP2 continuous to bin index
-    vp2_bins_idx = np.digitize(vp2, vp2_edges) - 1
-    vp2_bins_idx = np.clip(vp2_bins_idx, 0, len(vp2_edges) - 2)
+print("Computing model binary actions for test data...")
+test_model_actions_binary = select_action_batch_binary(test_data['states'], binary_agent, device)
 
-    # Combine: action_idx = vp1 * n_bins + vp2_bin
-    action_indices = vp1 * vp2_bins + vp2_bins_idx
-    return action_indices
+# Get clinician binary actions (already binary in the data, just extract VP1)
+# For binary CQL, actions are already binary (0 or 1), no discretization needed
 
-# Get model actions as discrete indices (0-9)
-print("Computing model actions (discrete) for training data...")
-train_model_actions_discrete = select_action_batch_discrete(train_data['states'], q1_network, q2_network, n_bins, device)
+train_clinician_actions_binary = train_data['actions'][:,0]  # VP1 is already binary
+test_clinician_actions_binary = test_data['actions'][:,0]    # VP1 is already binary
 
-print("Computing model actions (discrete) for test data...")
-test_model_actions_discrete = select_action_batch_discrete(test_data['states'], q1_network, q2_network, n_bins, device)
+print(f"\nBinary actions generated:")
+print(f"  Train model actions:     {train_model_actions_binary.shape}")
+print(f"  Train clinician actions: {train_clinician_actions_binary.shape}")
+print(f"  Test model actions:      {test_model_actions_binary.shape}")
+print(f"  Test clinician actions:  {test_clinician_actions_binary.shape}")
 
-# Convert clinician continuous actions to discrete indices (0-9)
-train_clinician_actions_discrete = continuous_to_discrete_action(train_data['actions'], vp2_bin_edges, n_bins)
-test_clinician_actions_discrete = continuous_to_discrete_action(test_data['actions'], vp2_bin_edges, n_bins)
+# Display sample binary actions
+print(f"\nSample binary actions (first 10):")
+print(f"  Model (train):     {train_model_actions_binary[:10]}")
+print(f"  Clinician (train): {train_clinician_actions_binary[:10]}")
 
-print(f"\nDiscrete action indices generated:")
-print(f"  Train model actions:     {train_model_actions_discrete.shape}")
-print(f"  Train clinician actions: {train_clinician_actions_discrete.shape}")
-print(f"  Test model actions:      {test_model_actions_discrete.shape}")
-print(f"  Test clinician actions:  {test_clinician_actions_discrete.shape}")
-
-# Display sample discrete actions
-print(f"\nSample discrete action indices (first 10):")
-print(f"  Model (train):     {train_model_actions_discrete[:10]}")
-print(f"  Clinician (train): {train_clinician_actions_discrete[:10]}")
-
-# Show action distribution (0-9)
-print(f"\nAction distribution (0-9):")
+# Show action distribution (0 or 1)
+print(f"\nAction distribution (binary: 0 or 1):")
 for action_idx in range(n_actions):
-    print(f"  Action {action_idx}: Model (train)={np.sum(train_model_actions_discrete==action_idx)}, "
-          f"Clinician (train)={np.sum(train_clinician_actions_discrete==action_idx)}, "
-          f"Model (test)={np.sum(test_model_actions_discrete==action_idx)}, "
-          f"Clinician (test)={np.sum(test_clinician_actions_discrete==action_idx)}") 
-
-## train a logistic classifier (lg_vp1_ma) to predict the vp1 model actions (binary) using the states on the training data, then use it on the test data to get the probability of clinician vp1 actions
-## train a logistic classifier (lg_vp1_ca) to predict the vp1 clinician actions (binary) using the states on the training data, then use it on the test data to get the probability of clinician vp1 actions
-## train a softmax classifier (sm_vp2_ma) to predict the vp2 model actions (block discrete) using the states on the training data, then use it on the test data to get the probability of clinician vp2 actions
-## train a softmax classifier (sm_vp2_ca) to predict the vp2 clinician (block discrete) using the states on the training data, then use it on the test data to get the probability of clinician vp2 actions
-## save the test data probabilities, and display some of them (each of the four)
+    print(f"  Action {action_idx}: Model (train)={np.sum(train_model_actions_binary==action_idx)}, "
+          f"Clinician (train)={np.sum(train_clinician_actions_binary==action_idx)}, "
+          f"Model (test)={np.sum(test_model_actions_binary==action_idx)}, "
+          f"Clinician (test)={np.sum(test_clinician_actions_binary==action_idx)}") 
 
 print("\n" + "="*70)
-print("TRAINING BEHAVIOR POLICY CLASSIFIERS (JOINT ACTION SPACE)")
+print("TRAINING BEHAVIOR POLICY CLASSIFIERS (BINARY ACTION SPACE)")
 print("="*70)
 
-# Train softmax classifier for model actions (0-9)
-print("\n1. Training softmax classifier for model actions (10 classes)...")
+# Train logistic classifier for model binary actions (0 or 1)
+print("\n1. Training logistic classifier for model binary actions (2 classes: 0 or 1)...")
 clf_model = LogisticRegression(multi_class='multinomial', solver='lbfgs', max_iter=1000, random_state=42)
-clf_model.fit(train_data['states'], train_model_actions_discrete)
-train_acc_model = accuracy_score(train_model_actions_discrete, clf_model.predict(train_data['states']))
-test_acc_model = accuracy_score(test_model_actions_discrete, clf_model.predict(test_data['states']))
+clf_model.fit(train_data['states'], train_model_actions_binary.astype(int))
+train_acc_model = accuracy_score(train_model_actions_binary, clf_model.predict(train_data['states']))
+test_acc_model = accuracy_score(test_model_actions_binary, clf_model.predict(test_data['states']))
 print(f"   Train accuracy: {train_acc_model:.4f}")
 print(f"   Test accuracy:  {test_acc_model:.4f}")
 
-# Train softmax classifier for clinician actions (0-9)
-print("\n2. Training softmax classifier for clinician actions (10 classes)...")
+# Train logistic classifier for clinician binary actions (0 or 1)
+print("\n2. Training logistic classifier for clinician binary actions (2 classes: 0 or 1)...")
 clf_clinician = LogisticRegression(multi_class='multinomial', solver='lbfgs', max_iter=1000, random_state=42)
-clf_clinician.fit(train_data['states'], train_clinician_actions_discrete)
-train_acc_clinician = accuracy_score(train_clinician_actions_discrete, clf_clinician.predict(train_data['states']))
-test_acc_clinician = accuracy_score(test_clinician_actions_discrete, clf_clinician.predict(test_data['states']))
+clf_clinician.fit(train_data['states'], train_clinician_actions_binary.astype(int))
+train_acc_clinician = accuracy_score(train_clinician_actions_binary, clf_clinician.predict(train_data['states']))
+test_acc_clinician = accuracy_score(test_clinician_actions_binary, clf_clinician.predict(test_data['states']))
 print(f"   Train accuracy: {train_acc_clinician:.4f}")
 print(f"   Test accuracy:  {test_acc_clinician:.4f}")
 
@@ -212,11 +185,11 @@ print("="*70)
 
 # Model policy: π_model(a_clinician | s)
 test_probs_model = clf_model.predict_proba(test_data['states'])
-test_prob_model = test_probs_model[np.arange(len(test_clinician_actions_discrete)), test_clinician_actions_discrete.astype(int)]
+test_prob_model = test_probs_model[np.arange(len(test_clinician_actions_binary)), test_clinician_actions_binary.astype(int)]
 
 # Clinician policy: π_clinician(a_clinician | s)
 test_probs_clinician = clf_clinician.predict_proba(test_data['states'])
-test_prob_clinician = test_probs_clinician[np.arange(len(test_clinician_actions_discrete)), test_clinician_actions_discrete.astype(int)]
+test_prob_clinician = test_probs_clinician[np.arange(len(test_clinician_actions_binary)), test_clinician_actions_binary.astype(int)]
 
 print(f"\nTest probability statistics:")
 print(f"  Model policy π(a_clinician|s)     - Mean: {test_prob_model.mean():.4f}, Std: {test_prob_model.std():.4f}, Min: {test_prob_model.min():.4f}, Max: {test_prob_model.max():.4f}")
@@ -230,10 +203,9 @@ for i in range(min(10, len(test_prob_model))):
     print(f"  {i:5d} | {test_prob_model[i]:.4f} | {test_prob_clinician[i]:.4f} | {ratio:.4f}") 
 
 
-# Finally for each of the transitions (indices) in the test data, compute pi_lg_vp1_ma(s) / (eps + pi_lg_vp1_ca(s)) * pi_sm_vp2_ma(s) / (esp + pi_sm_vp2_ca(s)) * R where R is the reward on that transition index or state, this is the expected reward using the model actions on that state
+# Finally for each of the transitions (indices) in the test data, compute is_weight * R where R is the reward on that transition index or state, this is the expected reward using the model actions on that state
 # then compute the per transition average of the expected reward (using the model recommended actions), as well as the per patient average of the expected reward (using the model recommended actions)
 # compare the two values with the average reward (the raw reward) per transition, and the average reward per patient
-# print out the results and save it in latex table in a separate latex file
 
 print("\n" + "="*70)
 print("COMPUTING IMPORTANCE SAMPLING WEIGHTS AND REWARDS")
@@ -246,10 +218,10 @@ eps = 1e-10
 # IS_weight = π_model(a_clinician|s) / π_clinician(a_clinician|s)
 is_weight = test_prob_model / (test_prob_clinician + eps)
 
+# simple clipping: keep 95% of the data and clip the out-lines 
 isw_ci_diff_lower = np.percentile(is_weight, 2.5)
 isw_ci_diff_upper = np.percentile(is_weight, 97.5)
 
-#is_weight = np.clip(is_weight, a_min = CLIP_MIN, a_max = CLIP_MAX)
 is_weight = np.clip(is_weight, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
 
 print(f"\nIS weight statistics:")
@@ -406,11 +378,12 @@ print("="*70)
 
 weights_per_trajectory_list = [] 
 total_rewards_per_trajectory_list = []
-weighted_rewards_per_trajectory_list = []
+weighted_rewards_per_trajectory_list = [] 
 
 for patient_id in unique_patients:
     patient_mask = test_patient_ids == patient_id
     """
+    ## keep track of the 'standard' way of computing trajectory-level WIS estimate of the expected rewards 
     mean_model_prob = test_prob_model[patient_mask].mean()
     mean_clinician_prob = test_prob_clinician[patient_mask].mean()
     patient_rewards = test_rewards[patient_mask]
@@ -423,39 +396,36 @@ for patient_id in unique_patients:
     else: 
         print("zero encountered in trajectory level multiplied weights")
     """
-    
-    # Get weights and rewards for this trajectory
+    # the two-step WIS method, one step to estimate trajectory-level WIS 
     patient_weights = is_weight[patient_mask]
     patient_rewards = test_rewards[patient_mask]
     est_total_reward_per_traj = (patient_weights *  patient_rewards).sum() / patient_weights.sum() * len(patient_weights)
     
     weights_per_trajectory_list.append(patient_weights.mean())
-    total_rewards_per_trajectory_list.append(patient_rewards.sum())
     weighted_rewards_per_trajectory_list.append(est_total_reward_per_traj)
-    
+    total_rewards_per_trajectory_list.append(patient_rewards.sum())
 
-#wisw_ci_diff_lower = np.percentile(weights_per_trajectory_list, 5)
-#wisw_ci_diff_upper = np.percentile(weights_per_trajectory_list, 95)
-
-#weights_per_trajectory_list = np.clip(weights_per_trajectory_list, a_min = wisw_ci_diff_lower, a_max = wisw_ci_diff_upper)
-
-#weights_per_trajectory_list = np.clip(weights_per_trajectory_list, a_min = 0.0, a_max = 10)
+# keep as comments: we can remove trajectory-level weight clipping using the two-step WIS method 
+#wisw_ci_diff_lower = np.percentile(weights_per_trajectory_list, 2)
+#wisw_ci_diff_upper = np.percentile(weights_per_trajectory_list, 98)
+#weights_per_trajectory_list = np.clip(weights_per_trajectory_list, a_min = 0.0, a_max = 5)
 
 # Compute mean WIS across all trajectories
 weights_per_trajectory_list = np.array(weights_per_trajectory_list)
 total_rewards_per_trajectory_list = np.array(total_rewards_per_trajectory_list)
 weighted_rewards_per_trajectory_list = np.array(weighted_rewards_per_trajectory_list)
 
+# step two of the two-step WIS, re-normalize trajectories to obtain the overall WIS 
 wis_trajectory_level = (weights_per_trajectory_list * weighted_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum() 
 
-# Also compute raw clinician per-trajectory for comparison
+# raw clinician action average trajectory level reward for comparison
 clinician_per_trajectory_mean = total_rewards_per_trajectory_list.mean()
 
 # Compute 95% confidence interval using bootstrapping for the DIFFERENCE
 print(f"\nComputing 95% CI for difference using bootstrapping (1000 iterations)...")
 
 # First, compute the difference for each trajectory
-# For clinician: just the raw reward sum per patient
+# For clinician: use the reference average trajectory level reward 
 # For model: WIS per trajectory (already computed)
 # Difference: s = WIS_model - raw_clinician for each patient
 
