@@ -26,7 +26,7 @@ python3 run_lstm_block_discrete_cql_with_logging.py
 read and use ope_exp.py and fqe_gaussian_analysis.py, the pkl files could be saved during training 
 
 ### WIS importance sampling evaluation: 
-read and use is_block_discrete.py, for example of evaluating the block discrete model. The same evaluation can be implemented for other models by changing the model definition and loading paths 
+read and use is_block_discrete.py, for example of evaluating the block discrete model. The same evaluation are implemented for other models (is_binary.py, is_dual_mixed.py, is_lstm_bd.py). 
 
 ### reward functions: 
 neurips reward definition is given in integrated_data_pipeline_v2_simple_reward.py, and OVISS reward definition is given in integrated_data_pipeline_v2.py 
