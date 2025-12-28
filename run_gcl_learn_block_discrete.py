@@ -125,21 +125,23 @@ class CostNN(nn.Module):
         self,
         state_dim: int,
         total_actions: int,
-        hidden_dim: int = 128,
     ):
         super().__init__()
         self.state_dim = state_dim
         self.total_actions = total_actions
 
         # Input: state + one-hot encoded action
+        # Architecture: input -> 128 -> 64 -> 32 -> 1 (aligned with MaxEnt IRL)
         input_dim = state_dim + total_actions
 
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(input_dim, 128),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
         )
 
         # Initialize weights
@@ -180,7 +182,6 @@ class GCLBlockDiscrete:
         state_dim: int,
         vp2_bins: int = 5,
         gamma: float = 0.99,
-        init_temp: float = 0.001,
         tau: float = 0.005,
         lr: float = 1e-4,
         cost_lr: float = 1e-2,
@@ -192,7 +193,6 @@ class GCLBlockDiscrete:
             state_dim: Dimension of state space
             vp2_bins: Number of bins for VP2 discretization
             gamma: Discount factor
-            init_temp: Soft-value temperature for policy (small for discrete actions)
             tau: Target network soft update rate
             lr: Learning rate for Q-networks
             cost_lr: Learning rate for cost network (default 1e-2 as in main.py)
@@ -203,7 +203,6 @@ class GCLBlockDiscrete:
         self.vp2_bins = vp2_bins
         self.total_actions = 2 * vp2_bins
         self.gamma = gamma
-        self.init_temp = init_temp
         self.tau = tau
         self.grad_clip = grad_clip
         self.use_target = use_target
@@ -258,36 +257,6 @@ class GCLBlockDiscrete:
         vp2_value = (self.vp2_bin_edges[vp2_bin] + self.vp2_bin_edges[vp2_bin + 1]) / 2
         return np.array([float(vp1_idx), vp2_value])
 
-    def getV(self, obs: torch.Tensor) -> torch.Tensor:
-        """
-        Compute soft-value function from Q-values.
-        V = alpha * logsumexp(Q / alpha) where alpha = init_temp
-
-        Args:
-            obs: [batch_size, state_dim]
-        Returns:
-            v: [batch_size, 1]
-        """
-        q1_all = self.q1.get_all_q_values(obs)
-        q2_all = self.q2.get_all_q_values(obs)
-        q_all = torch.min(q1_all, q2_all)
-        v = self.init_temp * torch.logsumexp(q_all / self.init_temp, dim=1, keepdim=True)
-        return v
-
-    def get_targetV(self, obs: torch.Tensor) -> torch.Tensor:
-        """
-        Compute soft-value function using target networks.
-
-        Args:
-            obs: [batch_size, state_dim]
-        Returns:
-            v: [batch_size, 1]
-        """
-        q1_all = self.q1_target.get_all_q_values(obs)
-        q2_all = self.q2_target.get_all_q_values(obs)
-        q_all = torch.min(q1_all, q2_all)
-        v = self.init_temp * torch.logsumexp(q_all / self.init_temp, dim=1, keepdim=True)
-        return v
 
     def select_action(self, state, return_discrete: bool = False):
         """
@@ -339,7 +308,6 @@ class GCLBlockDiscrete:
     def get_action_probabilities(
         self,
         states: torch.Tensor,
-        temperature: float = 1.0
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute action probabilities using softmax over Q-values.
@@ -374,7 +342,7 @@ class GCLBlockDiscrete:
 
         # Apply softmax to get action probabilities
         # π(a|s) = exp(Q(s,a)/τ) / Σ_a' exp(Q(s,a')/τ)
-        action_probs = F.softmax(q_values / temperature, dim=-1)
+        action_probs = F.softmax(q_values, dim=-1)
 
         # Get selected actions (argmax)
         selected_actions = action_probs.argmax(dim=-1)
@@ -418,7 +386,7 @@ class GCLBlockDiscrete:
         # Policy actions and probabilities (gradients flow through Q-networks)
         # This implements q(τ) in the GCL paper
         policy_action_probs, policy_action_indices, policy_q_values = self.get_action_probabilities(
-            states, temperature=self.init_temp
+            states,
         )
 
         # Get probability of the selected action for each sample: q(a|s)
@@ -486,39 +454,6 @@ class GCLBlockDiscrete:
 
         return loss_dict
 
-    def get_recovered_reward(
-        self,
-        states: torch.Tensor,
-        actions: torch.Tensor,
-        next_states: torch.Tensor,
-        dones: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Compute the recovered/implicit reward: r(s,a) = Q(s,a) - gamma*V(s')
-
-        Args:
-            states: [batch, state_dim]
-            actions: [batch, 2] continuous actions
-            next_states: [batch, state_dim]
-            dones: [batch]
-
-        Returns:
-            rewards: [batch] implicit rewards
-        """
-        with torch.no_grad():
-            action_indices = self.continuous_to_discrete_batch(actions)
-
-            q1 = self.q1(states, action_indices)
-            q2 = self.q2(states, action_indices)
-            q = torch.min(q1, q2)
-
-            next_v = self.get_targetV(next_states)
-            y = (1 - dones.unsqueeze(1)) * self.gamma * next_v
-
-            reward = (q - y).squeeze()
-
-        return reward
-
     def save(self, filepath: str):
         """Save model checkpoint."""
         torch.save({
@@ -531,7 +466,6 @@ class GCLBlockDiscrete:
             'state_dim': self.state_dim,
             'vp2_bins': self.vp2_bins,
             'gamma': self.gamma,
-            'init_temp': self.init_temp,
             'tau': self.tau,
         }, filepath)
         print(f"Model saved to: {filepath}")
@@ -545,7 +479,6 @@ class GCLBlockDiscrete:
             state_dim=checkpoint['state_dim'],
             vp2_bins=checkpoint['vp2_bins'],
             gamma=checkpoint['gamma'],
-            init_temp=checkpoint['init_temp'],
             tau=checkpoint['tau'],
         )
 
@@ -569,13 +502,16 @@ def train_gcl(
     epochs: int = 500,
     batch_size: int = 128,
     gamma: float = 0.99,
-    init_temp: float = 0.001,
     tau: float = 0.005,
     lr: float = 1e-4,
     cost_lr: float = 1e-2,
-    experiment_prefix: str = "gcl"
+    experiment_prefix: str = "gcl",
+    save_dir: str = "experiment/gcl"
 ):
     """Train GCL agent for inverse RL cost/reward recovery."""
+
+    # Create save directory
+    os.makedirs(save_dir, exist_ok=True)
 
     print("=" * 70, flush=True)
     print(" GCL BLOCK DISCRETE TRAINING", flush=True)
@@ -595,7 +531,6 @@ def train_gcl(
     print(f"  State dimension: {state_dim}", flush=True)
     print(f"  Action: VP1 (binary) x VP2 ({vp2_bins} bins) = {2 * vp2_bins} actions", flush=True)
     print(f"  gamma = {gamma}", flush=True)
-    print(f"  init_temp = {init_temp} (policy temperature)", flush=True)
     print(f"  tau = {tau} (target network update)", flush=True)
     print(f"  lr = {lr} (Q-network)", flush=True)
     print(f"  cost_lr = {cost_lr} (cost network)", flush=True)
@@ -608,7 +543,6 @@ def train_gcl(
         state_dim=state_dim,
         vp2_bins=vp2_bins,
         gamma=gamma,
-        init_temp=init_temp,
         tau=tau,
         lr=lr,
         cost_lr=cost_lr,
@@ -674,7 +608,7 @@ def train_gcl(
                 # Compute validation metrics (same as training but no backward)
                 expert_action_indices = agent.continuous_to_discrete_batch(actions)
                 policy_action_probs, policy_action_indices, policy_q_values = agent.get_action_probabilities(
-                    states, temperature=agent.init_temp
+                    states
                 )
                 policy_probs_for_actions = policy_action_probs.gather(
                     1, policy_action_indices.unsqueeze(1)
@@ -706,7 +640,7 @@ def train_gcl(
         val_loss = val_metrics['loss_IOC']
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            agent.save(f'experiment/gcl/{experiment_prefix}_bins{vp2_bins}_best.pt')
+            agent.save(f'{save_dir}/{experiment_prefix}_cost_model.pt')
 
         # Print progress
         if (epoch + 1) % 10 == 0:
@@ -723,7 +657,7 @@ def train_gcl(
                   f"{elapsed/60:.1f}min", flush=True)
 
     # Save final model
-    agent.save(f'experiment/gcl/{experiment_prefix}_bins{vp2_bins}_final.pt')
+    agent.save(f'{save_dir}/{experiment_prefix}_final.pt')
 
     total_time = time.time() - start_time
     print(f"\nTraining completed in {total_time/60:.1f} minutes!", flush=True)
@@ -745,11 +679,11 @@ def main():
     parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--init_temp', type=float, default=0.001)
     parser.add_argument('--tau', type=float, default=0.005)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--cost_lr', type=float, default=1e-2)
     parser.add_argument('--prefix', type=str, default='gcl')
+    parser.add_argument('--save_dir', type=str, default='experiment/gcl')
 
     args = parser.parse_args()
 
@@ -759,7 +693,6 @@ def main():
     print(f"\nConfiguration:", flush=True)
     print(f"  VP1: Binary (0 or 1)", flush=True)
     print(f"  VP2: {args.vp2_bins} bins", flush=True)
-    print(f"  init_temp: {args.init_temp}", flush=True)
     print(f"  lr: {args.lr}", flush=True)
     print(f"  cost_lr: {args.cost_lr}", flush=True)
 
@@ -768,11 +701,11 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         gamma=args.gamma,
-        init_temp=args.init_temp,
         tau=args.tau,
         lr=args.lr,
         cost_lr=args.cost_lr,
-        experiment_prefix=args.prefix
+        experiment_prefix=args.prefix,
+        save_dir=args.save_dir
     )
 
     print("\n" + "=" * 70, flush=True)

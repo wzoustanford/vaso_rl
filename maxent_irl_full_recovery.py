@@ -732,7 +732,7 @@ def run_irl_recovery(
         learning_rate=learning_rate,
         temperature=temperature
     )
-
+    
     history = trainer.train(
         trajectories=train_windows,
         n_epochs=n_epochs,
@@ -767,23 +767,40 @@ def run_irl_recovery(
 
 
 if __name__ == "__main__":
-    # Run IRL recovery with default parameters
-    trainer, history = run_irl_recovery(
-        model_type='binary',
-        n_epochs=100,
-        batch_size=64,
-        learning_rate=1e-3,
-        hidden_dims=[128, 64, 32],
-        temperature=1.0,
-        window_size=6,
-        random_seed=42,
-        experiment_prefix='irl_binary_v1',
-        save_dir='experiment/irl'
-    )
+    import argparse
 
-    # Example: Load the saved model
-    # loaded_trainer = MaxSLPIRLTrainer.load_model(
-    #     experiment_prefix='irl_binary_v1',
-    #     save_dir='experiment/irl',
-    #     hidden_dims=[128, 64, 32]
-    # )
+    parser = argparse.ArgumentParser(description='MaxEnt IRL Reward Recovery')
+    parser.add_argument('--model_type', type=str, default='dual', choices=['binary', 'dual'])
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--temperature', type=float, default=1.0)
+    parser.add_argument('--window_size', type=int, default=1)  # Default 1 for fair comparison
+    parser.add_argument('--prefix', type=str, default='maxent')
+    parser.add_argument('--save_dir', type=str, default='experiment/irl')
+
+    args = parser.parse_args()
+
+    print("=" * 70)
+    print(" MAXENT IRL: MAXIMUM ENTROPY INVERSE RL")
+    print("=" * 70)
+    print(f"\nConfiguration:")
+    print(f"  model_type: {args.model_type}")
+    print(f"  epochs: {args.epochs}")
+    print(f"  batch_size: {args.batch_size}")
+    print(f"  lr: {args.lr}")
+    print(f"  temperature: {args.temperature}")
+    print(f"  window_size: {args.window_size}")
+    print(f"  prefix: {args.prefix}")
+
+    trainer, history = run_irl_recovery(
+        model_type=args.model_type,
+        n_epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        temperature=args.temperature,
+        window_size=args.window_size,
+        random_seed=42,
+        experiment_prefix=args.prefix,
+        save_dir=args.save_dir
+    )

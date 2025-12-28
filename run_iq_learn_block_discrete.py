@@ -51,7 +51,7 @@ class BlockDiscreteQNetwork(nn.Module):
     Total: 2 * vp2_bins possible actions
     """
 
-    def __init__(self, state_dim: int, vp2_bins: int = 5, hidden_dim: int = 128):
+    def __init__(self, state_dim: int, vp2_bins: int = 5):
         super().__init__()
         self.state_dim = state_dim
         self.vp2_bins = vp2_bins
@@ -60,10 +60,11 @@ class BlockDiscreteQNetwork(nn.Module):
         # Network takes state + one-hot encoded action
         input_dim = state_dim + self.total_actions
 
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 64)
-        self.fc4 = nn.Linear(64, 1)
+        # Architecture: input -> 128 -> 64 -> 32 -> 1 (aligned with MaxEnt IRL)
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 32)
+        self.fc4 = nn.Linear(32, 1)
 
         # Xavier initialization
         nn.init.xavier_uniform_(self.fc1.weight)
@@ -135,7 +136,6 @@ class IQLearnBlockDiscrete:
         use_target: bool = True,
         div: str = "chi",
         loss_type: str = "value_expert",
-        use_chi: bool = True,
         regularize: bool = False,
         # grad_pen: bool = False,  # Commented out - for Wasserstein distance
         # lambda_gp: float = 10.0,  # Commented out - for Wasserstein distance
@@ -153,7 +153,6 @@ class IQLearnBlockDiscrete:
             use_target: Whether to use target network for next_V
             div: Divergence type ("chi", "kl", "kl2", "kl_fix", "js", "hellinger")
             loss_type: Value loss type ("value_expert", "value", "v0")
-            use_chi: Whether to use chi2 regularization (works offline)
             regularize: Whether to use chi2 regularization on all states (works online)
         """
         self.state_dim = state_dim
@@ -167,7 +166,6 @@ class IQLearnBlockDiscrete:
         self.use_target = use_target
         self.div = div
         self.loss_type = loss_type
-        self.use_chi = use_chi
         self.regularize = regularize
         # self.grad_pen = grad_pen  # Commented out - for Wasserstein distance
         # self.lambda_gp = lambda_gp  # Commented out - for Wasserstein distance
@@ -344,19 +342,20 @@ class IQLearnBlockDiscrete:
             # Different divergence functions
             # (For chi2 divergence, we add a third term instead)
             if self.div == "hellinger":
-                phi_grad = 1 / (1 + expert_reward) ** 2
+                phi_grad = 1 / (1 + expert_reward.clamp(min=-0.99)) ** 2
             elif self.div == "kl":
-                # original dual form for kl divergence (sub optimal)
-                phi_grad = torch.exp(-expert_reward - 1)
+                # original dual form for kl divergence (with clamping for stability)
+                phi_grad = torch.exp(-expert_reward.clamp(-20, 20) - 1)
             elif self.div == "kl2":
                 # biased dual form for kl divergence
                 phi_grad = F.softmax(-expert_reward, dim=0) * expert_reward.shape[0]
             elif self.div == "kl_fix":
-                # unbiased form for fixing kl divergence
-                phi_grad = torch.exp(-expert_reward)
+                # unbiased form for fixing kl divergence (with clamping for stability)
+                phi_grad = torch.exp(-expert_reward.clamp(-20, 20))
             elif self.div == "js":
-                # jensen-shannon
-                phi_grad = torch.exp(-expert_reward) / (2 - torch.exp(-expert_reward))
+                # jensen-shannon (with clamping to prevent div by zero)
+                exp_neg_r = torch.exp(-expert_reward.clamp(-20, 20))
+                phi_grad = exp_neg_r / (2 - exp_neg_r.clamp(max=1.99))
             else:
                 phi_grad = 1
 
@@ -408,7 +407,7 @@ class IQLearnBlockDiscrete:
         # chi2 divergence regularization
         # ==============================================================
 
-        if self.div == "chi" or self.use_chi:
+        if self.div == "chi":
             # chi2 regularization using expert states (works offline)
             chi2_loss = (1 / (4 * self.method_alpha)) * (expert_reward ** 2).mean()
             loss += chi2_loss
@@ -598,7 +597,6 @@ class IQLearnBlockDiscrete:
             'tau': self.tau,
             'div': self.div,
             'loss_type': self.loss_type,
-            'use_chi': self.use_chi,
             'regularize': self.regularize,
         }, filepath)
         print(f"Model saved to: {filepath}")
@@ -617,7 +615,6 @@ class IQLearnBlockDiscrete:
             tau=checkpoint['tau'],
             div=checkpoint['div'],
             loss_type=checkpoint['loss_type'],
-            use_chi=checkpoint['use_chi'],
             regularize=checkpoint['regularize'],
         )
 
@@ -646,11 +643,14 @@ def train_iq_learn(
     lr: float = 1e-4,
     div: str = "chi",
     loss_type: str = "value_expert",
-    use_chi: bool = True,
     regularize: bool = False,
-    experiment_prefix: str = "iq_learn"
+    experiment_prefix: str = "iq_learn",
+    save_dir: str = "experiment/iq_learn"
 ):
     """Train IQ-Learn agent for inverse RL reward recovery."""
+
+    # Create save directory
+    os.makedirs(save_dir, exist_ok=True)
 
     print("=" * 70, flush=True)
     print(" IQ-LEARN BLOCK DISCRETE TRAINING", flush=True)
@@ -676,7 +676,6 @@ def train_iq_learn(
     print(f"  lr = {lr}", flush=True)
     print(f"  div = {div}", flush=True)
     print(f"  loss_type = {loss_type}", flush=True)
-    print(f"  use_chi = {use_chi}", flush=True)
     print(f"  regularize = {regularize}", flush=True)
     print(f"  batch_size = {batch_size}", flush=True)
     print(f"  epochs = {epochs}", flush=True)
@@ -693,7 +692,6 @@ def train_iq_learn(
         lr=lr,
         div=div,
         loss_type=loss_type,
-        use_chi=use_chi,
         regularize=regularize,
     )
 
@@ -798,7 +796,7 @@ def train_iq_learn(
         val_loss = val_metrics['total_loss']
         if -val_loss > best_val_reward:  # Using negative loss for "best"
             best_val_reward = -val_loss
-            agent.save(f'experiment/iq_learn/{experiment_prefix}_bins{vp2_bins}_best.pt')
+            agent.save(f'{save_dir}/{experiment_prefix}_q_model.pt')
 
         # Print progress
         if (epoch + 1) % 10 == 0:
@@ -819,7 +817,7 @@ def train_iq_learn(
                   f"{elapsed/60:.1f}min", flush=True)
 
     # Save final model
-    agent.save(f'experiment/iq_learn/{experiment_prefix}_bins{vp2_bins}_final.pt')
+    agent.save(f'{save_dir}/{experiment_prefix}_final.pt')
 
     total_time = time.time() - start_time
     print(f"\nTraining completed in {total_time/60:.1f} minutes!", flush=True)
@@ -849,10 +847,9 @@ def main():
                         choices=['chi', 'kl', 'kl2', 'kl_fix', 'js', 'hellinger'])
     parser.add_argument('--loss_type', type=str, default='value_expert',
                         choices=['value_expert', 'value', 'v0'])
-    parser.add_argument('--use_chi', action='store_true', default=True)
-    parser.add_argument('--no_chi', action='store_false', dest='use_chi')
     parser.add_argument('--regularize', action='store_true', default=False)
     parser.add_argument('--prefix', type=str, default='iq_learn')
+    parser.add_argument('--save_dir', type=str, default='experiment/iq_learn')
 
     args = parser.parse_args()
 
@@ -866,7 +863,6 @@ def main():
     print(f"  loss_type: {args.loss_type}", flush=True)
     print(f"  init_temp: {args.init_temp}", flush=True)
     print(f"  method_alpha: {args.method_alpha}", flush=True)
-    print(f"  use_chi: {args.use_chi}", flush=True)
     print(f"  regularize: {args.regularize}", flush=True)
 
     agent, pipeline = train_iq_learn(
@@ -880,9 +876,9 @@ def main():
         lr=args.lr,
         div=args.div,
         loss_type=args.loss_type,
-        use_chi=args.use_chi,
         regularize=args.regularize,
-        experiment_prefix=args.prefix
+        experiment_prefix=args.prefix,
+        save_dir=args.save_dir
     )
 
     print("\n" + "=" * 70, flush=True)
