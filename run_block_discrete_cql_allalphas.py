@@ -23,6 +23,7 @@ import sys
 
 # Import our unified pipeline
 from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
+from integrated_data_pipeline_v3 import IntegratedDataPipelineV3
 
 # Force unbuffered output
 sys.stdout = sys.__stdout__
@@ -321,15 +322,46 @@ class DualBlockDiscreteCQL:
         }, filepath)
 
 
-def train_block_discrete_cql(alpha: float = 0.001, vp2_bins: int = 5):
-    """Train Block Discrete CQL with specified alpha"""
+def train_block_discrete_cql(
+    alpha: float = 0.001,
+    vp2_bins: int = 5,
+    epochs: int = 100,
+    reward_model_path: str = None,
+    suffix: str = "",
+    save_dir: str = "experiment/ql"
+):
+    """Train Block Discrete CQL with specified alpha and optional learned reward"""
+
+    # Create save directory
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Initialize data pipeline and infer reward type
+    print("\nInitializing Block Discrete CQL data pipeline...", flush=True)
+    if reward_model_path is None:
+        reward_type = "manual"
+        pipeline = IntegratedDataPipelineV2(model_type='dual', random_seed=42)
+    elif 'gcl' in reward_model_path:
+        reward_type = "gcl"
+        pipeline = IntegratedDataPipelineV3(model_type='dual', reward_source='learned', random_seed=42)
+        pipeline.load_gcl_reward_model(reward_model_path)
+    elif 'iq_learn' in reward_model_path:
+        reward_type = "iq_learn"
+        pipeline = IntegratedDataPipelineV3(model_type='dual', reward_source='learned', random_seed=42)
+        pipeline.load_iq_learn_reward_model(reward_model_path)
+    elif 'maxent' in reward_model_path:
+        reward_type = "maxent"
+        pipeline = IntegratedDataPipelineV3(model_type='dual', reward_source='learned', random_seed=42)
+        pipeline.load_maxent_reward_model(reward_model_path)
+    else:
+        raise ValueError(f"Cannot infer reward model type from path: {reward_model_path}")
+
+    experiment_prefix = f"{reward_type}{suffix}"
+
     print("="*70, flush=True)
     print(f" BLOCK DISCRETE CQL TRAINING WITH ALPHA={alpha}", flush=True)
+    print(f" Reward: {reward_type} | Prefix: {experiment_prefix}", flush=True)
     print("="*70, flush=True)
-    
-    # Initialize data pipeline
-    print("\nInitializing Block Discrete CQL data pipeline...", flush=True)
-    pipeline = IntegratedDataPipelineV2(model_type='dual', random_seed=42)
+
     train_data, val_data, test_data = pipeline.prepare_data()
     
     # Get state dimension
@@ -360,7 +392,6 @@ def train_block_discrete_cql(alpha: float = 0.001, vp2_bins: int = 5):
     )
     
     # Training loop
-    epochs = 500
     batch_size = 128
     print(f"\nTraining for {epochs} epochs with batch size {batch_size}...", flush=True)
     start_time = time.time()
@@ -436,7 +467,7 @@ def train_block_discrete_cql(alpha: float = 0.001, vp2_bins: int = 5):
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            agent.save(f'experiment/block_discrete_cql_alpha{alpha:.4f}_bins{vp2_bins}_best.pt')
+            agent.save(f'{save_dir}/{experiment_prefix}_alpha{alpha:.4f}_bins{vp2_bins}_best.pt')
         
         # Print progress
         if (epoch + 1) % 10 == 0:
@@ -449,15 +480,15 @@ def train_block_discrete_cql(alpha: float = 0.001, vp2_bins: int = 5):
                   f"Time={elapsed/60:.1f}min", flush=True)
     
     # Save final model
-    agent.save(f'experiment/block_discrete_cql_alpha{alpha:.4f}_bins{vp2_bins}_final.pt')
-    
+    agent.save(f'{save_dir}/{experiment_prefix}_alpha{alpha:.4f}_bins{vp2_bins}_final.pt')
+
     total_time = time.time() - start_time
-    print(f"\n✅ Block Discrete CQL (alpha={alpha}, bins={vp2_bins}) training completed in {total_time/60:.1f} minutes!", flush=True)
+    print(f"\nBlock Discrete CQL ({experiment_prefix}, alpha={alpha}, bins={vp2_bins}) completed in {total_time/60:.1f} minutes!", flush=True)
     print("Models saved:", flush=True)
-    print(f"  - experiment/block_discrete_cql_alpha{alpha:.4f}_bins{vp2_bins}_best.pt", flush=True)
-    print(f"  - experiment/block_discrete_cql_alpha{alpha:.4f}_bins{vp2_bins}_final.pt", flush=True)
-    
-    return agent, pipeline
+    print(f"  - {save_dir}/{experiment_prefix}_alpha{alpha:.4f}_bins{vp2_bins}_best.pt", flush=True)
+    print(f"  - {save_dir}/{experiment_prefix}_alpha{alpha:.4f}_bins{vp2_bins}_final.pt", flush=True)
+
+    return agent, pipeline, experiment_prefix
 
 
 
@@ -465,25 +496,33 @@ def train_block_discrete_cql(alpha: float = 0.001, vp2_bins: int = 5):
 def main():
     """Train Block Discrete CQL with multiple alpha values"""
     import argparse
-    
+
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Train Block Discrete CQL with different configurations')
-    parser.add_argument('--vp2_bins', type=int, default=5, 
+    parser.add_argument('--vp2_bins', type=int, default=5,
                        help='Number of bins for VP2 discretization (default: 5)')
     parser.add_argument('--alphas', type=float, nargs='+', default=[0.0],
                        help='Alpha values for CQL penalty (default: 0.0)')
     parser.add_argument('--single_alpha', type=float, default=None,
                        help='Train only with a single alpha value (overrides --alphas)')
+    parser.add_argument('--epochs', type=int, default=100,
+                       help='Number of training epochs (default: 100)')
+    parser.add_argument('--reward_model_path', type=str, default=None,
+                       help='Path to learned reward model (gcl/iq_learn/maxent). None=manual reward')
+    parser.add_argument('--suffix', type=str, default='',
+                       help='Suffix to add to experiment prefix (e.g., "_irl100")')
+    parser.add_argument('--save_dir', type=str, default='experiment/ql',
+                       help='Directory to save models (default: experiment/ql)')
     args = parser.parse_args()
-    
+
     # Determine alpha values to use
     if args.single_alpha is not None:
         alphas = [args.single_alpha]
     else:
         alphas = args.alphas
-    
+
     vp2_bins = args.vp2_bins
-    
+
     print("="*70, flush=True)
     print(" BLOCK DISCRETE CQL TRAINING", flush=True)
     print("="*70, flush=True)
@@ -491,21 +530,32 @@ def main():
     print("  - VP1: Binary (0 or 1)", flush=True)
     print(f"  - VP2: Discretized into {vp2_bins} bins (0 to 0.5 mcg/kg/min)", flush=True)
     print(f"  - Alpha values: {alphas}", flush=True)
+    print(f"  - Epochs: {args.epochs}", flush=True)
+    print(f"  - Reward model: {args.reward_model_path or 'manual'}", flush=True)
+    print(f"  - Suffix: {args.suffix}", flush=True)
     print("  - Consistent hyperparameters (tau=0.8, lr=1e-3)", flush=True)
-    print("  - Q(s,a) -> R architecture for comparable Q-values", flush=True)
     print(f"  - Total discrete actions: {2 * vp2_bins}", flush=True)
-    
+
     # Train with different alpha values
+    experiment_prefixes = []
     for alpha in alphas:
         print("\n" + "="*70, flush=True)
-        agent, pipeline = train_block_discrete_cql(alpha=alpha, vp2_bins=vp2_bins)
-    
+        agent, pipeline, exp_prefix = train_block_discrete_cql(
+            alpha=alpha,
+            vp2_bins=vp2_bins,
+            epochs=args.epochs,
+            reward_model_path=args.reward_model_path,
+            suffix=args.suffix,
+            save_dir=args.save_dir
+        )
+        experiment_prefixes.append(exp_prefix)
+
     print("\n" + "="*70, flush=True)
     print(" ALL TRAINING COMPLETE", flush=True)
     print("="*70, flush=True)
-    print("\nModels saved in experiment/ directory:", flush=True)
-    for alpha in alphas:
-        print(f"  Block Discrete CQL (alpha={alpha}, bins={vp2_bins}): block_discrete_cql_alpha{alpha:.4f}_bins{vp2_bins}_*.pt", flush=True)
+    print(f"\nModels saved in {args.save_dir}/ directory:", flush=True)
+    for alpha, exp_prefix in zip(alphas, experiment_prefixes):
+        print(f"  {exp_prefix}_alpha{alpha:.4f}_bins{vp2_bins}_*.pt", flush=True)
 
 
 if __name__ == "__main__":

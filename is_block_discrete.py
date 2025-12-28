@@ -7,14 +7,23 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, log_loss
 import os
+import argparse
 import warnings
 warnings.filterwarnings('ignore')
 
 # Import project modules
 from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
 
-# number of bins 
-n_bins = 10
+# Parse command line arguments
+parser = argparse.ArgumentParser(description='Importance Sampling evaluation for Block Discrete CQL')
+parser.add_argument('--model_path', type=str, required=True,
+                   help='Path to trained CQL model checkpoint')
+parser.add_argument('--vp2_bins', type=int, default=5,
+                   help='Number of bins for VP2 discretization (default: 5)')
+args = parser.parse_args()
+
+n_bins = args.vp2_bins
+model_path = args.model_path
 
 # Define constants
 STATE_DIM = 17  # 17 state features for dual model
@@ -36,10 +45,6 @@ q1_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(
 q2_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
 
 # Load the trained model checkpoint
-
-#[C-change: please make this selectable from a list of pre-trained models]
-model_path = f'experiment/epoch500_new_trained_oviss_reward_models/block_discrete_cql_alpha0.0000_bins{n_bins}_final.pt'
-
 checkpoint = torch.load(model_path, map_location=device)
 q1_network.load_state_dict(checkpoint['q1_state_dict'])
 q2_network.load_state_dict(checkpoint['q2_state_dict'])
@@ -187,35 +192,64 @@ print("\n" + "="*70)
 print("TRAINING BEHAVIOR POLICY CLASSIFIERS (JOINT ACTION SPACE)")
 print("="*70)
 
-# Train softmax classifier for model actions (0-9)
-print("\n1. Training softmax classifier for model actions (10 classes)...")
+# Helper function to get probabilities for all n_actions classes
+# even if classifier didn't see all classes during training
+def get_full_proba(clf, X, n_classes):
+    """
+    Get probability predictions ensuring output has n_classes columns.
+    If classifier didn't see some classes, assign them probability 0.
+    """
+    proba = clf.predict_proba(X)
+    if proba.shape[1] == n_classes:
+        return proba
+
+    # Map classifier's classes to full class set
+    full_proba = np.zeros((X.shape[0], n_classes))
+    for i, c in enumerate(clf.classes_):
+        full_proba[:, int(c)] = proba[:, i]
+
+    # Renormalize rows to sum to 1 (add small epsilon to missing classes)
+    # This prevents division by zero in importance sampling
+    missing_classes = set(range(n_classes)) - set(clf.classes_.astype(int))
+    if missing_classes:
+        print(f"   Warning: Classifier missing classes {missing_classes}, assigning small probability")
+        for c in missing_classes:
+            full_proba[:, c] = 1e-10
+        full_proba = full_proba / full_proba.sum(axis=1, keepdims=True)
+
+    return full_proba
+
+# Train softmax classifier for model actions (0 to n_actions-1)
+print(f"\n1. Training softmax classifier for model actions ({n_actions} classes)...")
 clf_model = LogisticRegression(multi_class='multinomial', solver='lbfgs', max_iter=1000, random_state=42)
 clf_model.fit(train_data['states'], train_model_actions_discrete)
+print(f"   Classifier learned classes: {sorted(clf_model.classes_)}")
 train_acc_model = accuracy_score(train_model_actions_discrete, clf_model.predict(train_data['states']))
 test_acc_model = accuracy_score(test_model_actions_discrete, clf_model.predict(test_data['states']))
 print(f"   Train accuracy: {train_acc_model:.4f}")
 print(f"   Test accuracy:  {test_acc_model:.4f}")
 
-# Train softmax classifier for clinician actions (0-9)
-print("\n2. Training softmax classifier for clinician actions (10 classes)...")
+# Train softmax classifier for clinician actions (0 to n_actions-1)
+print(f"\n2. Training softmax classifier for clinician actions ({n_actions} classes)...")
 clf_clinician = LogisticRegression(multi_class='multinomial', solver='lbfgs', max_iter=1000, random_state=42)
 clf_clinician.fit(train_data['states'], train_clinician_actions_discrete)
+print(f"   Classifier learned classes: {sorted(clf_clinician.classes_)}")
 train_acc_clinician = accuracy_score(train_clinician_actions_discrete, clf_clinician.predict(train_data['states']))
 test_acc_clinician = accuracy_score(test_clinician_actions_discrete, clf_clinician.predict(test_data['states']))
 print(f"   Train accuracy: {train_acc_clinician:.4f}")
 print(f"   Test accuracy:  {test_acc_clinician:.4f}")
 
-# Get probabilities on test data
+# Get probabilities on test data (ensuring all n_actions classes are present)
 print("\n" + "="*70)
 print("COMPUTING BEHAVIOR POLICY PROBABILITIES")
 print("="*70)
 
 # Model policy: π_model(a_clinician | s)
-test_probs_model = clf_model.predict_proba(test_data['states'])
+test_probs_model = get_full_proba(clf_model, test_data['states'], n_actions)
 test_prob_model = test_probs_model[np.arange(len(test_clinician_actions_discrete)), test_clinician_actions_discrete.astype(int)]
 
 # Clinician policy: π_clinician(a_clinician | s)
-test_probs_clinician = clf_clinician.predict_proba(test_data['states'])
+test_probs_clinician = get_full_proba(clf_clinician, test_data['states'], n_actions)
 test_prob_clinician = test_probs_clinician[np.arange(len(test_clinician_actions_discrete)), test_clinician_actions_discrete.astype(int)]
 
 print(f"\nTest probability statistics:")
