@@ -352,6 +352,13 @@ def train_block_discrete_cql(
         reward_type = "maxent"
         pipeline = IntegratedDataPipelineV3(model_type='dual', reward_source='learned', random_seed=42)
         pipeline.load_maxent_reward_model(reward_model_path)
+    elif 'unet' in reward_model_path:
+        # U-Net provides learned rewards via per-trajectory inference
+        reward_type = "unet"
+        pipeline = IntegratedDataPipelineV3(model_type='dual', reward_source='learned', random_seed=42)
+        # Load U-Net model with default vp1_bins=2, vp2_bins=5
+        # TODO: Read vp2_bins from checkpoint or command line args
+        pipeline.load_unet_reward_model(reward_model_path, vp1_bins=2, vp2_bins=vp2_bins)
     else:
         raise ValueError(f"Cannot infer reward model type from path: {reward_model_path}")
 

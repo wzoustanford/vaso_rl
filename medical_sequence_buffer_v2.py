@@ -3,15 +3,7 @@ Medical Sequence Buffer for R2D2-style Sequential Learning
 ==========================================================
 Implements a sequence replay buffer specifically designed for medical RL,
 handling patient episodes and generating overlapping sequences for LSTM training.
-
-Always use overlap = 1 due to missing of the ending signal (mortality) 
-The real fix is use overlap=1, then subsample from the dataset. 
-[todo-fix] implement overlap=1 then use subsampling. 
-[raw notes] there is a problem with the current implementation. (1) if the trajectory length is 16, and overlap = 5, seq_len=10, then the last generated sequence would be starting at 5 and finishes at 15, the 16th time step has an important 
-reward - the mortality rewared signal. It is also the most important signal for the RL training. I think we are missing that for large overlap values. I would also propose a fix for this: could we to a reverse of the start index and run a 
-similar sequence generation logic, only we would start from the end of the sequence? The eventual fix could be we start sampling from both end and start of the sequence for cases where sampling is required.
 """
-
 
 import numpy as np
 import torch
@@ -61,7 +53,7 @@ except ImportError:
             return sum(self.priorities)
 
 
-class MedicalSequenceBuffer:
+class MedicalSequenceBufferV2:
     """
     Sequence replay buffer for medical RL with patient-aware sampling.
     
@@ -146,9 +138,6 @@ class MedicalSequenceBuffer:
         """
         # Check for patient boundary
         if patient_id != self.current_patient_id:
-            if self.current_patient_id is not None:
-                self._process_patient_episode()
-            
             self.current_patient_id = patient_id
             self.current_patient_buffer = []
             self.current_patient_metadata = metadata or {}
@@ -172,16 +161,14 @@ class MedicalSequenceBuffer:
         
         # Generate sequences if buffer is long enough
         if len(self.current_patient_buffer) >= self.sequence_length:
-            # Check if we should generate a new sequence based on overlap
             buffer_len = len(self.current_patient_buffer)
-            sequences_generated = (buffer_len - self.sequence_length) // self.overlap + 1
-            
             if (buffer_len - self.sequence_length) % self.overlap == 0:
                 self._generate_sequence_at_index(buffer_len - self.sequence_length)
         
-        # Process episode if done
+        # Clear state when episode ends to handle multiple episodes from same patient
         if done:
-            self._process_patient_episode()
+            self.current_patient_buffer = []
+            self.current_patient_id = None
     
     def _generate_sequence_at_index(self, start_idx: int):
         """Generate a single sequence starting at the given index."""
@@ -215,35 +202,6 @@ class MedicalSequenceBuffer:
         self.tree.add(priority, sequence_data)
         self.max_priority = max(self.max_priority, priority)
         self.total_sequences_generated += 1
-    
-    def _process_patient_episode(self):
-        """Process remaining sequences when patient episode ends."""
-        if len(self.current_patient_buffer) < self.sequence_length:
-            # Not enough data for a full sequence
-            if len(self.current_patient_buffer) > self.burn_in_length:
-                # Could pad shorter sequences if desired
-                pass
-            return
-        
-        # Generate any remaining sequences
-        buffer_len = len(self.current_patient_buffer)
-        last_start = buffer_len - self.sequence_length
-        
-        # Generate final sequences with overlap
-        current_start = 0
-        while current_start <= last_start:
-            # Check if this sequence hasn't been generated yet
-            sequences_so_far = current_start // self.overlap
-            expected_sequences = (current_start // self.overlap) + 1
-            
-            if sequences_so_far < expected_sequences:
-                self._generate_sequence_at_index(current_start)
-            
-            current_start += self.overlap
-        
-        # Clear patient buffer
-        self.current_patient_buffer = []
-        self.current_patient_id = None
     
     def _calculate_medical_priority(self, sequence: List[Dict]) -> float:
         """
@@ -491,10 +449,10 @@ class SequenceDataLoader:
 
 # Test function
 if __name__ == "__main__":
-    print("Testing Medical Sequence Buffer...")
-    
+    print("Testing Medical Sequence Buffer V2...")
+
     # Create buffer
-    buffer = MedicalSequenceBuffer(
+    buffer = MedicalSequenceBufferV2(
         capacity=1000,
         sequence_length=10,
         burn_in_length=5,
