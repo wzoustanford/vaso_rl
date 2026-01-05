@@ -1,9 +1,16 @@
 #!/bin/bash
 # Experiment pipeline for IRL reward learning + Q-Learning + WIS evaluation
 # Usage: ./run_experiment.sh <algorithm> [options]
-# Example: ./run_experiment.sh gcl --test
-#          ./run_experiment.sh maxent --irl_epochs 50 --ql_epochs 100
-#          ./run_experiment.sh iq_learn --iq_init_temp 0.01 --iq_tau 0.01 --iq_lr 1e-3 --iq_div chi
+#
+# Algorithms: manual, maxent, gcl, iq_learn, unet
+#
+# Examples:
+#   ./run_experiment.sh gcl --test
+#   ./run_experiment.sh maxent --irl_epochs 50 --ql_epochs 100
+#   ./run_experiment.sh iq_learn --iq_init_temp 0.01 --iq_tau 0.01 --iq_lr 1e-3 --iq_div chi
+#   ./run_experiment.sh unet --unet_epochs 100 --unet_conv_h_dim 16
+#   ./run_experiment.sh unet --skip_irl --irl_model_path experiments/unet/model_epoch_100.pt
+#   ./run_experiment.sh manual  # Use manual reward, skip IRL training
 
 set -e  # Exit on error
 
@@ -25,6 +32,14 @@ IQ_INIT_TEMP=0.001
 IQ_TAU=0.005
 IQ_LR=1e-4
 IQ_DIV="chi"
+
+# U-Net-specific defaults
+UNET_EPOCHS=100
+UNET_CONV_H_DIM=16
+UNET_D=5
+UNET_GAMMA=0.99
+UNET_LR=1e-4
+SKIP_IRL=false
 
 # Parse arguments
 shift  # Remove first argument (algorithm)
@@ -81,6 +96,35 @@ while [[ $# -gt 0 ]]; do
             IQ_DIV="$2"
             shift 2
             ;;
+        --unet_epochs)
+            UNET_EPOCHS="$2"
+            shift 2
+            ;;
+        --unet_conv_h_dim)
+            UNET_CONV_H_DIM="$2"
+            shift 2
+            ;;
+        --unet_d)
+            UNET_D="$2"
+            shift 2
+            ;;
+        --unet_gamma)
+            UNET_GAMMA="$2"
+            shift 2
+            ;;
+        --unet_lr)
+            UNET_LR="$2"
+            shift 2
+            ;;
+        --skip_irl)
+            SKIP_IRL=true
+            shift
+            ;;
+        --irl_model_path)
+            IRL_MODEL_PATH="$2"
+            SKIP_IRL=true
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -96,6 +140,7 @@ echo "IRL Epochs: $IRL_EPOCHS"
 echo "QL Epochs: $QL_EPOCHS"
 echo "VP2 Bins: $VP2_BINS"
 echo "Test Mode: $TEST_MODE"
+echo "Skip IRL: $SKIP_IRL"
 echo "Suffix: $SUFFIX"
 if [ "$ALGORITHM" == "gcl" ]; then
     echo "GCL tau: $GCL_TAU"
@@ -107,6 +152,16 @@ if [ "$ALGORITHM" == "iq_learn" ]; then
     echo "IQ tau: $IQ_TAU"
     echo "IQ lr: $IQ_LR"
     echo "IQ div: $IQ_DIV"
+fi
+if [ "$ALGORITHM" == "unet" ]; then
+    echo "U-Net epochs: $UNET_EPOCHS"
+    echo "U-Net conv_h_dim: $UNET_CONV_H_DIM"
+    echo "U-Net D: $UNET_D"
+    echo "U-Net gamma: $UNET_GAMMA"
+    echo "U-Net lr: $UNET_LR"
+fi
+if [ -n "$IRL_MODEL_PATH" ]; then
+    echo "Pre-trained IRL model: $IRL_MODEL_PATH"
 fi
 echo "=============================================="
 
@@ -122,8 +177,27 @@ mkdir -p "$IRL_DIR"
 mkdir -p "$QL_DIR"
 mkdir -p "$RESULTS_DIR"
 
-# Step 1: IRL Training (skip for manual)
-if [ "$ALGORITHM" != "manual" ]; then
+# Step 1: IRL Training (skip for manual or if --skip_irl is set)
+if [ "$ALGORITHM" == "manual" ]; then
+    echo ""
+    echo "=============================================="
+    echo "Step 1: Skipping IRL Training (using manual reward)"
+    echo "=============================================="
+    REWARD_MODEL_PATH=""
+elif [ "$SKIP_IRL" == "true" ] && [ -n "$IRL_MODEL_PATH" ]; then
+    echo ""
+    echo "=============================================="
+    echo "Step 1: Skipping IRL Training (using pre-trained model)"
+    echo "=============================================="
+    REWARD_MODEL_PATH="$IRL_MODEL_PATH"
+    echo "Using pre-trained IRL model: $REWARD_MODEL_PATH"
+elif [ "$SKIP_IRL" == "true" ]; then
+    echo ""
+    echo "=============================================="
+    echo "Step 1: Skipping IRL Training (no model provided)"
+    echo "=============================================="
+    REWARD_MODEL_PATH=""
+else
     echo ""
     echo "=============================================="
     echo "Step 1: IRL Training ($ALGORITHM)"
@@ -159,6 +233,23 @@ if [ "$ALGORITHM" != "manual" ]; then
                 --save_dir "$IRL_DIR"
             REWARD_MODEL_PATH="${IRL_DIR}/iq_learn${SUFFIX}_q_model.pt"
             ;;
+        unet)
+            UNET_DIR="${EXPERIMENT_DIR}/unet${SUFFIX}"
+            mkdir -p "$UNET_DIR"
+            python "${SCRIPT_DIR}/unet_reward_generator.py" \
+                --epochs "$UNET_EPOCHS" \
+                --conv_h_dim "$UNET_CONV_H_DIM" \
+                --D "$UNET_D" \
+                --gamma "$UNET_GAMMA" \
+                --lr "$UNET_LR" \
+                --experiment_dir "$UNET_DIR"
+            # Find the latest model
+            REWARD_MODEL_PATH=$(ls -t "${UNET_DIR}"/model_epoch_*.pt 2>/dev/null | head -1)
+            if [ -z "$REWARD_MODEL_PATH" ]; then
+                echo "Error: No U-Net model found in $UNET_DIR"
+                exit 1
+            fi
+            ;;
         *)
             echo "Unknown algorithm: $ALGORITHM"
             exit 1
@@ -166,12 +257,6 @@ if [ "$ALGORITHM" != "manual" ]; then
     esac
 
     echo "IRL training complete. Model saved to: $REWARD_MODEL_PATH"
-else
-    echo ""
-    echo "=============================================="
-    echo "Step 1: Skipping IRL Training (using manual reward)"
-    echo "=============================================="
-    REWARD_MODEL_PATH=""
 fi
 
 # Step 2: Q-Learning

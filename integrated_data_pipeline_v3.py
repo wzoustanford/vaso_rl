@@ -1,6 +1,6 @@
 """
 Integrated data pipeline V3 with LEARNED reward functions
-Loads reward models from MaxEnt IRL, GCL, or IQ-Learn to replace manual reward design.
+Loads reward models from MaxEnt IRL, GCL, IQ-Learn, or U-Net to replace manual reward design.
 
 Produces (s, a, r, s', done, patient_id) tuples for CQL training
 where r comes from a learned reward/cost function.
@@ -8,6 +8,7 @@ where r comes from a learned reward/cost function.
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from typing import Dict, Tuple, Optional, Union
 from sklearn.preprocessing import StandardScaler
 
@@ -15,6 +16,9 @@ import data_config as config
 from data_loader import DataLoader
 from data_loader import DataSplitter
 from maxent_irl_full_recovery import RewardNetwork
+
+# Minimum sequence length for U-Net (3 conv layers each shrink by 2)
+MIN_SEQ_LEN_UNET = 7
 
 
 class IntegratedDataPipelineV3:
@@ -25,6 +29,7 @@ class IntegratedDataPipelineV3:
     - GCL: reward = -cost_f(s, a)
     - IQ-Learn: reward = Q(s,a) - gamma*V(s')
     - MaxEnt IRL: reward = reward_network(s, a)
+    - U-Net: reward = per-timestep reward from U-Net reward generator
     """
 
     def __init__(
@@ -54,8 +59,14 @@ class IntegratedDataPipelineV3:
 
         # Learned reward model (loaded separately)
         self.reward_model = None
-        self.reward_model_type = None  # 'gcl', 'iq_learn', or 'maxent'
+        self.reward_model_type = None  # 'gcl', 'iq_learn', 'maxent', or 'unet'
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # U-Net specific parameters (set when loading U-Net model)
+        # TODO: Future improvement - read these from the model checkpoint directly
+        self.unet_n_actions = None
+        self.unet_vp1_bins = None
+        self.unet_vp2_bins = None
 
         # Store processed data as (s, a, r, s', done, patient_id) tuples
         self.train_data = None
@@ -133,6 +144,128 @@ class IntegratedDataPipelineV3:
 
         print(f"Loaded MaxEnt IRL reward model from: {checkpoint_path}")
         print(f"  Reward = R(s, a)")
+
+    def load_unet_reward_model(self, checkpoint_path: str, vp1_bins: int = 2, vp2_bins: int = 5):
+        """
+        Load U-Net model for reward computation.
+        U-Net outputs per-timestep rewards for each trajectory.
+
+        Args:
+            checkpoint_path: Path to U-Net checkpoint (.pt file)
+            vp1_bins: Number of VP1 bins (default 2 for binary)
+            vp2_bins: Number of VP2 bins (default 5)
+
+        Note: vp1_bins and vp2_bins should match the model's action_size.
+        TODO: Future improvement - read these from the model checkpoint directly.
+        """
+        from unet_reward_generator import UNetRewardGenerator
+
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        # Get model parameters from checkpoint
+        state_size = checkpoint.get('state_size')
+        action_size = checkpoint.get('action_size', vp1_bins * vp2_bins)
+        conv_h_dim = checkpoint.get('conv_h_dim', 64)
+
+        # Fallback: infer from model weights if not found
+        if state_size is None:
+            input_size = checkpoint['model_state_dict']['enc1.0.weight'].shape[1]
+            state_size = input_size - action_size
+
+        # Store U-Net specific parameters
+        self.unet_vp1_bins = vp1_bins
+        self.unet_vp2_bins = vp2_bins
+        self.unet_n_actions = vp1_bins * vp2_bins
+
+        # Initialize and load model
+        self.reward_model = UNetRewardGenerator(
+            state_size=state_size,
+            action_size=action_size,
+            conv_h_dim=conv_h_dim
+        ).to(self.device)
+        self.reward_model.load_state_dict(checkpoint['model_state_dict'])
+        self.reward_model_type = 'unet'
+        self.reward_model.eval()
+
+        print(f"Loaded U-Net reward model from: {checkpoint_path}")
+        print(f"  state_size: {state_size}, action_size: {action_size}, conv_h_dim: {conv_h_dim}")
+        print(f"  vp1_bins: {vp1_bins}, vp2_bins: {vp2_bins}")
+        print(f"  Reward = per-timestep output from U-Net")
+
+    def _continuous_to_discrete_action_unet(self, actions: np.ndarray) -> np.ndarray:
+        """
+        Convert continuous actions [vp1, vp2] to discrete action indices for U-Net.
+        action_idx = vp1 * vp2_bins + vp2_bin
+        """
+        if self.unet_vp2_bins is None:
+            raise ValueError("U-Net model not loaded. Call load_unet_reward_model() first.")
+
+        vp2_bin_edges = np.linspace(0, 0.5, self.unet_vp2_bins + 1)
+
+        vp1 = actions[:, 0].astype(int)  # Binary 0 or 1
+        vp2 = actions[:, 1].clip(0, 0.5)
+
+        # Convert VP2 continuous to bin index
+        vp2_bins_idx = np.digitize(vp2, vp2_bin_edges) - 1
+        vp2_bins_idx = np.clip(vp2_bins_idx, 0, self.unet_vp2_bins - 1)
+
+        # Combine: action_idx = vp1 * vp2_bins + vp2_bin
+        action_indices = vp1 * self.unet_vp2_bins + vp2_bins_idx
+        return action_indices
+
+    def _compute_unet_rewards_for_trajectory(
+        self,
+        patient_states: np.ndarray,
+        patient_actions: np.ndarray
+    ) -> np.ndarray:
+        """
+        Infer rewards for a single patient trajectory using U-Net model.
+
+        Args:
+            patient_states: [seq_len, state_size] normalized states
+            patient_actions: [seq_len, 2] continuous actions [vp1, vp2]
+
+        Returns:
+            rewards: [seq_len-1] rewards for each transition (t -> t+1)
+
+        Reward mapping:
+            - U-Net outputs [seq_len] rewards: r[0], r[1], ..., r[seq_len-1]
+            - Transition t: (s[t], a[t], s[t+1]) gets reward r[t]
+            - Last transition (t=seq_len-2): (s[seq_len-2], a[seq_len-2], s[seq_len-1]) gets r[seq_len-2]
+            - r[seq_len-1] (reward at terminal state) is NOT used since there's no transition from it
+        """
+        seq_len = len(patient_states)
+
+        # For very short trajectories, return zeros
+        if seq_len < MIN_SEQ_LEN_UNET:
+            return np.zeros(seq_len - 1, dtype=np.float32)
+
+        with torch.no_grad():
+            # Convert continuous actions to discrete indices
+            actions_discrete = self._continuous_to_discrete_action_unet(patient_actions)
+
+            # Convert to tensors
+            states_tensor = torch.FloatTensor(patient_states).unsqueeze(0).to(self.device)
+            actions_tensor = torch.LongTensor(actions_discrete).unsqueeze(0).to(self.device)
+
+            # Convert actions to one-hot
+            actions_one_hot = F.one_hot(actions_tensor, num_classes=self.unet_n_actions).float()
+
+            # Concatenate state-action pairs
+            state_action = torch.cat([states_tensor, actions_one_hot], dim=-1)
+
+            # Forward pass through U-Net
+            # Input: [batch=1, seq_len, state_size + action_size]
+            # Output: [batch=1, seq_len, 1]
+            rewards_pred = self.reward_model(state_action)
+
+            # Extract rewards
+            # rewards_pred has shape [1, seq_len, 1] -> squeeze to [seq_len]
+            rewards = rewards_pred.squeeze().cpu().numpy()
+
+            # Return rewards for transitions 0 to seq_len-2
+            # (r[seq_len-1] at terminal state is not used - no transition from it)
+            return rewards[:-1].astype(np.float32)
 
     def _compute_learned_reward(
         self,
@@ -341,30 +474,67 @@ class IntegratedDataPipelineV3:
         """
         Recompute rewards using the learned reward model on normalized states.
         Called after data processing when reward_source='learned'.
-        """
-        batch_size = 1024  # Process in batches for memory efficiency
 
-        for split_name, data in [('train', self.train_data),
-                                  ('val', self.val_data),
-                                  ('test', self.test_data)]:
+        For U-Net: Process by trajectory since U-Net needs full sequences.
+        For GCL/IQ-Learn/MaxEnt: Process in batches.
+        """
+        for split_name, data, patient_groups in [
+            ('train', self.train_data, self.train_patient_groups),
+            ('val', self.val_data, self.val_patient_groups),
+            ('test', self.test_data, self.test_patient_groups)
+        ]:
             if data is None:
                 continue
 
             n_transitions = data['n_transitions']
             new_rewards = np.zeros(n_transitions, dtype=np.float32)
 
-            for start_idx in range(0, n_transitions, batch_size):
-                end_idx = min(start_idx + batch_size, n_transitions)
+            if self.reward_model_type == 'unet':
+                # U-Net: Process by trajectory (patient)
+                # U-Net requires full trajectory context for reward prediction
+                print(f"   {split_name}: Processing {len(patient_groups)} patients for U-Net rewards...")
+                for i, (patient_id, (start_idx, end_idx)) in enumerate(patient_groups.items()):
+                    if (i + 1) % 500 == 0:
+                        print(f"     Processed {i+1}/{len(patient_groups)} patients")
 
-                states_batch = data['states'][start_idx:end_idx]
-                actions_batch = data['actions'][start_idx:end_idx]
-                next_states_batch = data['next_states'][start_idx:end_idx]
-                dones_batch = data['dones'][start_idx:end_idx]
+                    # Get patient's trajectory data
+                    # Note: Need seq_len timesteps but we have seq_len-1 transitions
+                    # Reconstruct full trajectory: states + last next_state
+                    patient_states = data['states'][start_idx:end_idx]
+                    patient_actions = data['actions'][start_idx:end_idx]
+                    last_next_state = data['next_states'][end_idx - 1:end_idx]  # [1, state_size]
 
-                rewards_batch = self._compute_learned_reward(
-                    states_batch, actions_batch, next_states_batch, dones_batch
-                )
-                new_rewards[start_idx:end_idx] = rewards_batch
+                    # Reconstruct full trajectory states [seq_len, state_size]
+                    full_states = np.vstack([patient_states, last_next_state])
+
+                    # For actions, we need seq_len actions
+                    # The last action can be a repeat of the previous one (arbitrary choice for terminal)
+                    last_action = patient_actions[-1:] if len(patient_actions) > 0 else np.zeros((1, patient_actions.shape[1]))
+                    full_actions = np.vstack([patient_actions, last_action])
+
+                    # Compute rewards for this trajectory
+                    trajectory_rewards = self._compute_unet_rewards_for_trajectory(
+                        full_states, full_actions
+                    )
+
+                    # Assign rewards to transitions
+                    # trajectory_rewards has shape [seq_len-1], matching our transitions
+                    new_rewards[start_idx:end_idx] = trajectory_rewards
+            else:
+                # GCL/IQ-Learn/MaxEnt: Process in batches
+                batch_size = 1024
+                for start_idx in range(0, n_transitions, batch_size):
+                    end_idx = min(start_idx + batch_size, n_transitions)
+
+                    states_batch = data['states'][start_idx:end_idx]
+                    actions_batch = data['actions'][start_idx:end_idx]
+                    next_states_batch = data['next_states'][start_idx:end_idx]
+                    dones_batch = data['dones'][start_idx:end_idx]
+
+                    rewards_batch = self._compute_learned_reward(
+                        states_batch, actions_batch, next_states_batch, dones_batch
+                    )
+                    new_rewards[start_idx:end_idx] = rewards_batch
 
             data['rewards'] = new_rewards
             print(f"   {split_name}: Reward range [{new_rewards.min():.3f}, {new_rewards.max():.3f}]")

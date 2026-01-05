@@ -1,6 +1,7 @@
 ### import relevant libraries
 import torch, pdb
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
@@ -12,63 +13,91 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Import project modules
-from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
 from integrated_data_pipeline_v3 import IntegratedDataPipelineV3
+from unet_reward_generator import UNetRewardGenerator, Config
 
 # Parse command line arguments
-parser = argparse.ArgumentParser(description='Importance Sampling evaluation for Block Discrete CQL')
+parser = argparse.ArgumentParser(description='Importance Sampling evaluation for IRL Policy Models')
 parser.add_argument('--model_path', type=str, required=True,
-                   help='Path to trained CQL model checkpoint')
+                   help='Path to trained IRL policy model checkpoint')
+parser.add_argument('--model_type', type=str, default='unet', choices=['unet', 'gcl', 'iqlearn'],
+                   help='Type of IRL policy model (default: unet)')
 parser.add_argument('--vp2_bins', type=int, default=5,
                    help='Number of bins for VP2 discretization (default: 5)')
 parser.add_argument('--eval_set', type=str, default='test', choices=['val', 'test'],
                    help='Which data split to evaluate on (default: test)')
-parser.add_argument('--reward_type', type=str, default='manual', choices=['manual', 'irl'],
-                   help='Reward type: manual (clinician-defined) or irl (learned from IRL model)')
-parser.add_argument('--irl_model_path', type=str, default=None,
-                   help='Path to IRL model for reward computation (required if reward_type=irl)')
+parser.add_argument('--temperature', type=float, default=1.0,
+                   help='Temperature for softmax policy (default: 1.0)')
+parser.add_argument('--sequence_length', type=int, default=40,
+                   help='Sequence length for U-Net processing (default: 40)')
 args = parser.parse_args()
-
-# Validate arguments
-if args.reward_type == 'irl' and args.irl_model_path is None:
-    parser.error("--irl_model_path is required when --reward_type=irl")
 
 n_bins = args.vp2_bins
 model_path = args.model_path
+model_type = args.model_type
 eval_set = args.eval_set
-reward_type = args.reward_type
-irl_model_path = args.irl_model_path
+temperature = args.temperature
+sequence_length = args.sequence_length
 
 # Define constants
-STATE_DIM = 17  # 17 state features for dual model
+n_actions = 2 * n_bins  # VP1 (2 options) x VP2 (n_bins) = total actions
 
-### define the block discrete model
-# - load the trained block discrete model
+### Load the IRL policy model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
+print(f"Model type: {model_type}")
 
-# Import the network class from the training script
-from run_block_discrete_cql_allalphas import DualBlockDiscreteQNetwork
-
-# Model parameters
-n_actions = 2 * n_bins  # VP1 (2 options: 0,1) x VP2 (5 bins) = 10 total actions
-state_dim = STATE_DIM  # 17 features
-
-# Initialize Q-networks (we use both Q1 and Q2, then take min)
-q1_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
-q2_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
-
-# Load the trained model checkpoint
+# Load checkpoint
 checkpoint = torch.load(model_path, map_location=device)
-q1_network.load_state_dict(checkpoint['q1_state_dict'])
-q2_network.load_state_dict(checkpoint['q2_state_dict'])
-q1_network.eval()
-q2_network.eval()
 
-print(f"Loaded model from: {model_path}")
-print(f"State dimension: {state_dim}")
+if model_type == 'unet':
+    # ============================================================
+    # U-Net Reward Generator Model
+    # ============================================================
+    # Get state_size, action_size, conv_h_dim from checkpoint (saved at top level)
+    state_size = checkpoint.get('state_size')
+    action_size = checkpoint.get('action_size', n_actions)
+    conv_h_dim = checkpoint.get('conv_h_dim', 64)
+
+    # Fallback: infer from model weights if not found
+    if state_size is None:
+        input_size = checkpoint['model_state_dict']['enc1.0.weight'].shape[1]
+        state_size = input_size - action_size
+
+    print(f"Loaded config - state_size: {state_size}, action_size: {action_size}, conv_h_dim: {conv_h_dim}")
+
+    # Initialize U-Net model with matching architecture
+    irl_model = UNetRewardGenerator(state_size=state_size, action_size=action_size, conv_h_dim=conv_h_dim).to(device)
+    irl_model.load_state_dict(checkpoint['model_state_dict'])
+    irl_model.eval()
+
+    print(f"Loaded U-Net model from: {model_path}")
+
+elif model_type == 'gcl':
+    # ============================================================
+    # GCL (Guided Cost Learning) Policy Model - PLACEHOLDER
+    # ============================================================
+    # TODO: Implement GCL model loading
+    # from gcl_policy import GCLPolicy
+    # irl_model = GCLPolicy(state_size=state_size, action_size=action_size).to(device)
+    # irl_model.load_state_dict(checkpoint['model_state_dict'])
+    # irl_model.eval()
+    raise NotImplementedError("GCL policy model loading not yet implemented")
+
+elif model_type == 'iqlearn':
+    # ============================================================
+    # IQ-Learn Policy Model - PLACEHOLDER
+    # ============================================================
+    # TODO: Implement IQ-Learn model loading
+    # from iqlearn_policy import IQLearnPolicy
+    # irl_model = IQLearnPolicy(state_size=state_size, action_size=action_size).to(device)
+    # irl_model.load_state_dict(checkpoint['model_state_dict'])
+    # irl_model.eval()
+    raise NotImplementedError("IQ-Learn policy model loading not yet implemented")
+
+print(f"State dimension: {state_size}")
 print(f"Number of actions: {n_actions} (VP1: 2 binary × VP2: {n_bins} bins)")
-print("Using min(Q1, Q2) for action selection (double Q-learning)") 
+print(f"Temperature for softmax policy: {temperature}") 
 
 ###
 # prepare and load the data with random seed 42
@@ -77,32 +106,10 @@ print("\n" + "="*70)
 print("LOADING DATA")
 print("="*70)
 print(f"Evaluation set: {eval_set}")
-print(f"Reward type: {reward_type}")
-if irl_model_path:
-    print(f"IRL model: {irl_model_path}")
 
-# Initialize data pipeline based on reward type
-if reward_type == 'irl':
-    # Use V3 pipeline with learned rewards
-    pipeline = IntegratedDataPipelineV3(model_type='dual', reward_source='learned', random_seed=42)
-
-    # Detect IRL model type from path and load accordingly
-    if 'iq_learn' in irl_model_path.lower():
-        pipeline.load_iq_learn_reward_model(irl_model_path)
-    elif 'gcl' in irl_model_path.lower():
-        pipeline.load_gcl_reward_model(irl_model_path)
-    elif 'maxent' in irl_model_path.lower():
-        pipeline.load_maxent_reward_model(irl_model_path)
-    else:
-        # Try to infer from file content or default to iq_learn
-        print(f"Warning: Could not detect IRL model type from path, trying IQ-Learn...")
-        pipeline.load_iq_learn_reward_model(irl_model_path)
-
-    train_data, val_data, test_data = pipeline.prepare_data()
-else:
-    # Use V2 pipeline with manual rewards
-    pipeline = IntegratedDataPipelineV2(model_type='dual', random_seed=42)
-    train_data, val_data, test_data = pipeline.prepare_data()
+# Initialize data pipeline with manual rewards (IRL policy models generate their own rewards)
+pipeline = IntegratedDataPipelineV3(model_type='dual', reward_source='manual', random_seed=42)
+train_data, val_data, test_data = pipeline.prepare_data()
 
 # Select evaluation data based on eval_set argument
 if eval_set == 'val':
@@ -136,12 +143,8 @@ print(f"\nData shapes:")
 print(f"  States:  {train_data['states'].shape}")
 print(f"  Actions: {train_data['actions'].shape}")
 print(f"  Rewards: {train_data['rewards'].shape}")
-print(f"  Reward type: {reward_type}")
 
 ## use the trained model to predict the optimal actions predicted by the model
-## for example to get model actions: model_actions = model.select_action(states)
-## for example to get clinician actions: clinician_actions = data.actions
-## note the resulting action should have both vp1 action and vp2 action
 
 print("\n" + "="*70)
 print("GENERATING MODEL ACTIONS")
@@ -151,43 +154,10 @@ print("="*70)
 vp2_bin_edges = np.linspace(0, 0.5, n_bins + 1)
 print(f"VP2 bin edges: {vp2_bin_edges}")
 
-# Helper function to select actions and return DISCRETE indices (0-9)
-def select_action_batch_discrete(states, q1_net, q2_net, vp2_bins, device):
-    """
-    Select best actions for a batch of states using min(Q1, Q2)
-    Returns: numpy array of discrete action indices [0-9]
-    """
-    with torch.no_grad():
-        if states.ndim == 1:
-            states = states.reshape(1, -1)
-
-        batch_size = states.shape[0]
-        state_tensor = torch.FloatTensor(states).to(device)
-
-        # Create all possible discrete actions for each state in batch
-        total_actions = 2 * vp2_bins  # 10 actions
-        all_actions = torch.arange(total_actions).to(device)
-        all_actions = all_actions.unsqueeze(0).expand(batch_size, -1)
-
-        # Expand states to match actions
-        state_expanded = state_tensor.unsqueeze(1).expand(-1, total_actions, -1)
-        state_expanded = state_expanded.reshape(-1, state_dim)
-        actions_flat = all_actions.reshape(-1)
-
-        # Compute Q-values for all actions
-        q1_values = q1_net(state_expanded, actions_flat).reshape(batch_size, total_actions)
-        q2_values = q2_net(state_expanded, actions_flat).reshape(batch_size, total_actions)
-        q_values = torch.min(q1_values, q2_values)
-
-        # Get best action indices (0-9)
-        best_action_indices = q_values.argmax(dim=1).cpu().numpy()
-
-        return best_action_indices
-
 # Helper function to convert continuous actions to discrete indices
 def continuous_to_discrete_action(actions, vp2_edges, vp2_bins):
     """
-    Convert continuous actions [vp1, vp2] to discrete action indices (0-9)
+    Convert continuous actions [vp1, vp2] to discrete action indices (0 to n_actions-1)
     action_idx = vp1 * n_bins + vp2_bin
     """
     vp1 = actions[:, 0].astype(int)  # Binary 0 or 1
@@ -201,16 +171,203 @@ def continuous_to_discrete_action(actions, vp2_edges, vp2_bins):
     action_indices = vp1 * vp2_bins + vp2_bins_idx
     return action_indices
 
-# Get model actions as discrete indices (0-9)
-print("Computing model actions (discrete) for training data...")
-train_model_actions_discrete = select_action_batch_discrete(train_data['states'], q1_network, q2_network, n_bins, device)
 
-print(f"Computing model actions (discrete) for {eval_set_name.lower()} data...")
-eval_model_actions_discrete = select_action_batch_discrete(eval_data['states'], q1_network, q2_network, n_bins, device)
+# ============================================================
+# U-Net: Compute Q-values from reward predictions
+# ============================================================
+def compute_q_values_unet(model, states_seq, actions_seq, D, gamma, device):
+    """
+    Compute Q-values for all actions at each timestep using U-Net reward generator.
 
-# Convert clinician continuous actions to discrete indices (0-9)
-train_clinician_actions_discrete = continuous_to_discrete_action(train_data['actions'], vp2_bin_edges, n_bins)
-eval_clinician_actions_discrete = continuous_to_discrete_action(eval_data['actions'], vp2_bin_edges, n_bins)
+    NOTE: For timesteps ct >= seq_len - D, we use reduced horizon (fewer future steps).
+    This could cause issues due to insufficient look-ahead for those timesteps.
+
+    Args:
+        model: UNetRewardGenerator model
+        states_seq: [batch, seq_len, state_size] tensor
+        actions_seq: [batch, seq_len] discrete action indices
+        D: horizon for Q computation
+        gamma: discount factor
+        device: torch device
+
+    Returns:
+        q_values: [batch, seq_len, n_actions] Q-values for each action at each timestep
+    """
+    batch_size, seq_len, state_size = states_seq.shape
+    action_size = model.action_size
+
+    # Convert expert actions to one-hot
+    expert_action_one_hot = F.one_hot(actions_seq, num_classes=action_size).float()
+
+    # Expand for all action choices at current timestep
+    states_expanded = states_seq.unsqueeze(2).expand(-1, -1, action_size, -1)
+    expert_action_expanded = expert_action_one_hot.unsqueeze(2).expand(-1, -1, action_size, -1)
+
+    # Eye matrix for replacing actions at timestep ct
+    action_eye = torch.eye(action_size, device=device).unsqueeze(0).expand(batch_size, -1, -1)
+
+    # Discount factors for horizon D
+    discount = torch.tensor([gamma ** t for t in range(D)], device=device)
+
+    # Initialize Q-values
+    q_values_all = torch.zeros(batch_size, seq_len, action_size, device=device)
+
+    # Compute Q-values for all timesteps
+    # NOTE: For ct >= seq_len - D, we have insufficient look-ahead (reduced horizon)
+    for ct in range(seq_len):
+        # Replace expert action at ct with all possible actions
+        cur_action_expanded = expert_action_expanded.clone()
+        cur_action_expanded[:, ct, :, :] = action_eye
+        state_action = torch.cat([states_expanded, cur_action_expanded], dim=-1)
+
+        # Reshape and forward through U-Net
+        state_action_flat = state_action.permute(0, 2, 1, 3).reshape(
+            batch_size * action_size, seq_len, state_size + action_size
+        )
+        rewards_pred = model(state_action_flat)
+        rewards_pred = rewards_pred.reshape(batch_size, action_size, seq_len, 1)
+        rewards_pred = rewards_pred.squeeze(-1).permute(0, 2, 1)
+
+        # Q = sum of discounted future rewards
+        # Use reduced horizon if near end of sequence
+        remaining = min(D, seq_len - ct)
+        future_rewards = rewards_pred[:, ct:ct+remaining, :]
+        discount_slice = discount[:remaining]
+        Q_values = (future_rewards * discount_slice.unsqueeze(0).unsqueeze(-1)).sum(dim=1)
+        q_values_all[:, ct, :] = Q_values
+
+    return q_values_all
+
+
+# ============================================================
+# GCL: Compute Q-values - PLACEHOLDER
+# ============================================================
+def compute_q_values_gcl(model, states, device):
+    """TODO: Implement GCL Q-value computation"""
+    raise NotImplementedError("GCL Q-value computation not yet implemented")
+
+
+# ============================================================
+# IQ-Learn: Compute Q-values - PLACEHOLDER
+# ============================================================
+def compute_q_values_iqlearn(model, states, device):
+    """TODO: Implement IQ-Learn Q-value computation"""
+    raise NotImplementedError("IQ-Learn Q-value computation not yet implemented")
+
+
+# ============================================================
+# U-Net: Get model actions for all transitions
+# ============================================================
+MIN_SEQ_LEN = 7  # Minimum length for U-Net (due to 3 conv layers shrinking by 6)
+
+def get_model_actions_unet(model, data, vp2_bin_edges, n_bins, D, gamma, device):
+    """
+    Process each patient trajectory at its actual length (no padding needed).
+    U-Net handles variable-length inputs via Conv1d.
+
+    Returns:
+        model_actions: best action for each transition
+        clinician_actions_discrete: clinician actions as discrete indices
+    """
+    states = data['states']
+    actions = data['actions']
+    patient_ids = data['patient_ids']
+
+    n_transitions = len(states)
+
+    # Convert clinician actions to discrete
+    clinician_actions_discrete = continuous_to_discrete_action(actions, vp2_bin_edges, n_bins)
+
+    # Initialize output
+    model_actions = np.zeros(n_transitions, dtype=int)
+
+    # Process by patient
+    unique_patients = np.unique(patient_ids)
+    print(f"Processing {len(unique_patients)} patients...")
+
+    with torch.no_grad():
+        for i, pid in enumerate(unique_patients):
+            if (i + 1) % 100 == 0:
+                print(f"  Processed {i+1}/{len(unique_patients)} patients")
+
+            mask = patient_ids == pid
+            patient_states = states[mask]
+            patient_actions = clinician_actions_discrete[mask]
+            patient_indices = np.where(mask)[0]
+            seq_len = len(patient_states)
+
+            # Skip very short trajectories (U-Net needs min length)
+            if seq_len < MIN_SEQ_LEN:
+                # Use uniform random or clinician action for short sequences
+                model_actions[patient_indices] = patient_actions
+                continue
+
+            # Convert to tensors (batch_size=1, variable seq_len)
+            states_tensor = torch.FloatTensor(patient_states).unsqueeze(0).to(device)
+            actions_tensor = torch.LongTensor(patient_actions).unsqueeze(0).to(device)
+
+            # Compute Q-values for this patient's trajectory
+            q_values = compute_q_values_unet(model, states_tensor, actions_tensor, D, gamma, device)
+            q_values = q_values.squeeze(0)  # [seq_len, action_size]
+
+            # Get best actions (argmax)
+            best_actions = q_values.argmax(dim=-1).cpu().numpy()
+
+            # Assign to output
+            model_actions[patient_indices] = best_actions
+
+    return model_actions, clinician_actions_discrete
+
+
+# ============================================================
+# GCL: Get model actions - PLACEHOLDER
+# ============================================================
+def get_model_actions_gcl(model, data, vp2_bin_edges, n_bins, device):
+    """TODO: Implement GCL action selection"""
+    raise NotImplementedError("GCL action selection not yet implemented")
+
+
+# ============================================================
+# IQ-Learn: Get model actions - PLACEHOLDER
+# ============================================================
+def get_model_actions_iqlearn(model, data, vp2_bin_edges, n_bins, device):
+    """TODO: Implement IQ-Learn action selection"""
+    raise NotImplementedError("IQ-Learn action selection not yet implemented")
+
+
+# Get Q-value computation parameters
+config = Config()
+D = config.D
+gamma = config.gamma
+
+print(f"\nQ-value computation parameters:")
+print(f"  Horizon D: {D}")
+print(f"  Discount gamma: {gamma}")
+
+# Compute model actions based on model type
+if model_type == 'unet':
+    print("\nComputing model actions for training data...")
+    train_model_actions_discrete, train_clinician_actions_discrete = get_model_actions_unet(
+        irl_model, train_data, vp2_bin_edges, n_bins, D, gamma, device
+    )
+    print(f"\nComputing model actions for {eval_set_name.lower()} data...")
+    eval_model_actions_discrete, eval_clinician_actions_discrete = get_model_actions_unet(
+        irl_model, eval_data, vp2_bin_edges, n_bins, D, gamma, device
+    )
+elif model_type == 'gcl':
+    train_model_actions_discrete, train_clinician_actions_discrete = get_model_actions_gcl(
+        irl_model, train_data, vp2_bin_edges, n_bins, device
+    )
+    eval_model_actions_discrete, eval_clinician_actions_discrete = get_model_actions_gcl(
+        irl_model, eval_data, vp2_bin_edges, n_bins, device
+    )
+elif model_type == 'iqlearn':
+    train_model_actions_discrete, train_clinician_actions_discrete = get_model_actions_iqlearn(
+        irl_model, train_data, vp2_bin_edges, n_bins, device
+    )
+    eval_model_actions_discrete, eval_clinician_actions_discrete = get_model_actions_iqlearn(
+        irl_model, eval_data, vp2_bin_edges, n_bins, device
+    )
 
 print(f"\nDiscrete action indices generated:")
 print(f"  Train model actions:     {train_model_actions_discrete.shape}")
@@ -223,8 +380,8 @@ print(f"\nSample discrete action indices (first 10):")
 print(f"  Model (train):     {train_model_actions_discrete[:10]}")
 print(f"  Clinician (train): {train_clinician_actions_discrete[:10]}")
 
-# Show action distribution (0-9)
-print(f"\nAction distribution (0-9):")
+# Show action distribution
+print(f"\nAction distribution (0-{n_actions-1}):")
 for action_idx in range(n_actions):
     print(f"  Action {action_idx}: Model (train)={np.sum(train_model_actions_discrete==action_idx)}, "
           f"Clinician (train)={np.sum(train_clinician_actions_discrete==action_idx)}, "
@@ -344,7 +501,7 @@ eval_rewards = eval_data['rewards']
 # Compute IS-weighted rewards
 is_weighted_rewards = is_weight * eval_rewards
 
-print(f"\nReward statistics ({reward_type}):")
+print(f"\nReward statistics:")
 print(f"  Raw rewards (clinician)     - Mean: {eval_rewards.mean():.4f}, Std: {eval_rewards.std():.4f}, Sum: {eval_rewards.sum():.2f}")
 print(f"  IS-weighted rewards (model) - Mean: {is_weighted_rewards.mean():.4f}, Std: {is_weighted_rewards.std():.4f}, Sum: {is_weighted_rewards.sum():.2f}")
 
@@ -397,10 +554,11 @@ print(f"  IS (model):         Mean: {patient_is_rewards.mean():.4f}, Std: {patie
 os.makedirs('latex', exist_ok=True)
 
 # Save results to LaTeX table
+model_type_label = {'unet': 'U-Net Reward Generator', 'gcl': 'GCL', 'iqlearn': 'IQ-Learn'}
 latex_output = r"""\begin{table}[h]
 \centering
-\caption{Importance Sampling Off-Policy Evaluation Results (Block Discrete CQL, $\alpha=0.0$)}
-\label{tab:is_ope_results}
+\caption{Importance Sampling Off-Policy Evaluation Results (%s)}
+\label{tab:is_ope_results_%s}
 \begin{tabular}{lcc}
 \hline
 \textbf{Metric} & \textbf{Clinician Policy} & \textbf{Model Policy (IS)} \\
@@ -423,6 +581,7 @@ Per-Patient & \multicolumn{2}{c}{%.4f} \\
 \end{tabular}
 \end{table}
 """ % (
+    model_type_label.get(model_type, model_type), model_type,
     avg_raw_reward_per_transition, avg_is_reward_per_transition,
     avg_raw_reward_per_patient, avg_is_reward_per_patient,
     patient_raw_rewards.std(), patient_is_rewards.std(),
@@ -434,7 +593,7 @@ Per-Patient & \multicolumn{2}{c}{%.4f} \\
     avg_is_reward_per_patient - avg_raw_reward_per_patient
 )
 
-latex_file = 'latex/is_ope_results.tex'
+latex_file = f'latex/is_ope_results_{model_type}.tex'
 with open(latex_file, 'w') as f:
     f.write(latex_output)
 
