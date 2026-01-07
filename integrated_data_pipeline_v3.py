@@ -158,7 +158,7 @@ class IntegratedDataPipelineV3:
         Note: vp1_bins and vp2_bins should match the model's action_size.
         TODO: Future improvement - read these from the model checkpoint directly.
         """
-        from unet_reward_generator import UNetRewardGenerator
+        from unet_reward_generator_tanh import UNetRewardGenerator
 
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 

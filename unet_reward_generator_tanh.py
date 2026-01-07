@@ -105,9 +105,12 @@ class UNetRewardGenerator(nn.Module):
             #nn.BatchNorm1d(conv_h_dim),
             nn.ReLU()
         )
-        
+
         # Output layer: produces 1 reward per timestep
-        self.output_layer = nn.Conv1d(conv_h_dim, 1, kernel_size=1)
+        self.output_layer = nn.Sequential(
+            nn.Conv1d(conv_h_dim, 1, kernel_size=1),
+            nn.Tanh()
+        )
     
     def encode(self, x: torch.Tensor) -> tuple:
         """
@@ -557,7 +560,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--conv_h_dim', type=int, default=128, help='Conv hidden dimension')
+    parser.add_argument('--conv_h_dim', type=int, default=64, help='Conv hidden dimension')
     parser.add_argument('--D', type=int, default=10, help='Q-value horizon')
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
     parser.add_argument('--vp1_bins', type=int, default=2, help='VP1 bins')
@@ -576,7 +579,7 @@ def main():
         gamma=args.gamma,
         vp1_bins=args.vp1_bins,
         vp2_bins=args.vp2_bins,
-        experiment_dir=args.experiment_dir+'_'+str(args.conv_h_dim),
+        experiment_dir=args.experiment_dir+'_'+str(args.conv_h_dim)+'_tanh',
     )
 
     print(f"Config: epochs={config.num_epochs}, batch_size={config.batch_size}, "
