@@ -328,9 +328,15 @@ def train_block_discrete_cql(
     epochs: int = 100,
     reward_model_path: str = None,
     suffix: str = "",
-    save_dir: str = "experiment/ql"
+    save_dir: str = "experiment/ql",
+    reward_combine_lambda: float = None
 ):
-    """Train Block Discrete CQL with specified alpha and optional learned reward"""
+    """Train Block Discrete CQL with specified alpha and optional learned reward
+
+    Args:
+        reward_combine_lambda: If None, use pure IRL reward. If in [0, 1], use
+            (1 - lambda) * manual_reward + lambda * irl_reward.
+    """
 
     # Create save directory
     os.makedirs(save_dir, exist_ok=True)
@@ -342,27 +348,50 @@ def train_block_discrete_cql(
         pipeline = IntegratedDataPipelineV2(model_type='dual', random_seed=42)
     elif 'gcl' in reward_model_path:
         reward_type = "gcl"
-        pipeline = IntegratedDataPipelineV3(model_type='dual', reward_source='learned', random_seed=42)
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda
+        )
         pipeline.load_gcl_reward_model(reward_model_path)
     elif 'iq_learn' in reward_model_path:
         reward_type = "iq_learn"
-        pipeline = IntegratedDataPipelineV3(model_type='dual', reward_source='learned', random_seed=42)
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda
+        )
         pipeline.load_iq_learn_reward_model(reward_model_path)
     elif 'maxent' in reward_model_path:
         reward_type = "maxent"
-        pipeline = IntegratedDataPipelineV3(model_type='dual', reward_source='learned', random_seed=42)
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda
+        )
         pipeline.load_maxent_reward_model(reward_model_path)
+    elif 'semi_supervised_unet' in reward_model_path:
+        # Semi-supervised U-Net provides learned rewards via per-trajectory inference
+        reward_type = "semi_supervised_unet"
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda
+        )
+        # Load Semi-supervised U-Net model (uses only UNetRewardGenerator, not MortalityDiffuser)
+        pipeline.load_semi_supervised_unet_reward_model(reward_model_path, vp1_bins=2, vp2_bins=vp2_bins)
     elif 'unet' in reward_model_path:
         # U-Net provides learned rewards via per-trajectory inference
         reward_type = "unet"
-        pipeline = IntegratedDataPipelineV3(model_type='dual', reward_source='learned', random_seed=42)
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda
+        )
         # Load U-Net model with default vp1_bins=2, vp2_bins=5
         # TODO: Read vp2_bins from checkpoint or command line args
         pipeline.load_unet_reward_model(reward_model_path, vp1_bins=2, vp2_bins=vp2_bins)
     else:
         raise ValueError(f"Cannot infer reward model type from path: {reward_model_path}")
 
-    experiment_prefix = f"{reward_type}{suffix}"
+    # Use pipeline's get_reward_prefix for correct naming with lambda
+    experiment_prefix = pipeline.get_reward_prefix() if hasattr(pipeline, 'get_reward_prefix') else reward_type
+    experiment_prefix = f"{experiment_prefix}{suffix}"
 
     print("="*70, flush=True)
     print(f" BLOCK DISCRETE CQL TRAINING WITH ALPHA={alpha}", flush=True)
@@ -520,6 +549,9 @@ def main():
                        help='Suffix to add to experiment prefix (e.g., "_irl100")')
     parser.add_argument('--save_dir', type=str, default='experiment/ql',
                        help='Directory to save models (default: experiment/ql)')
+    parser.add_argument('--reward_combine_lambda', type=float, default=None,
+                       help='Lambda for combining manual and IRL rewards: '
+                            '(1-lambda)*manual + lambda*IRL. None=pure IRL reward.')
     args = parser.parse_args()
 
     # Determine alpha values to use
@@ -539,6 +571,7 @@ def main():
     print(f"  - Alpha values: {alphas}", flush=True)
     print(f"  - Epochs: {args.epochs}", flush=True)
     print(f"  - Reward model: {args.reward_model_path or 'manual'}", flush=True)
+    print(f"  - Reward combine lambda: {args.reward_combine_lambda}", flush=True)
     print(f"  - Suffix: {args.suffix}", flush=True)
     print("  - Consistent hyperparameters (tau=0.8, lr=1e-3)", flush=True)
     print(f"  - Total discrete actions: {2 * vp2_bins}", flush=True)
@@ -553,7 +586,8 @@ def main():
             epochs=args.epochs,
             reward_model_path=args.reward_model_path,
             suffix=args.suffix,
-            save_dir=args.save_dir
+            save_dir=args.save_dir,
+            reward_combine_lambda=args.reward_combine_lambda
         )
         experiment_prefixes.append(exp_prefix)
 

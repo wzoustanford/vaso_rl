@@ -2,7 +2,7 @@
 # Experiment pipeline for IRL reward learning + Q-Learning + WIS evaluation
 # Usage: ./run_experiment.sh <algorithm> [options]
 #
-# Algorithms: manual, maxent, gcl, iq_learn, unet
+# Algorithms: manual, maxent, gcl, iq_learn, unet, semi_supervised_unet
 #
 # Examples:
 #   ./run_experiment.sh gcl --test
@@ -10,6 +10,7 @@
 #   ./run_experiment.sh iq_learn --iq_init_temp 0.01 --iq_tau 0.01 --iq_lr 1e-3 --iq_div chi
 #   ./run_experiment.sh unet --unet_epochs 100 --unet_conv_h_dim 16
 #   ./run_experiment.sh unet --skip_irl --irl_model_path experiments/unet/model_epoch_100.pt
+#   ./run_experiment.sh semi_supervised_unet --unet_epochs 100 --unet_conv_h_dim 64
 #   ./run_experiment.sh manual  # Use manual reward, skip IRL training
 
 set -e  # Exit on error
@@ -40,6 +41,9 @@ UNET_D=5
 UNET_GAMMA=0.99
 UNET_LR=1e-4
 SKIP_IRL=false
+
+# Reward combination defaults
+REWARD_COMBINE_LAMBDA=""  # Empty means pure IRL reward
 
 # Parse arguments
 shift  # Remove first argument (algorithm)
@@ -125,6 +129,10 @@ while [[ $# -gt 0 ]]; do
             SKIP_IRL=true
             shift 2
             ;;
+        --reward_combine_lambda)
+            REWARD_COMBINE_LAMBDA="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -153,15 +161,22 @@ if [ "$ALGORITHM" == "iq_learn" ]; then
     echo "IQ lr: $IQ_LR"
     echo "IQ div: $IQ_DIV"
 fi
-if [ "$ALGORITHM" == "unet" ]; then
+if [ "$ALGORITHM" == "unet" ] || [ "$ALGORITHM" == "semi_supervised_unet" ]; then
     echo "U-Net epochs: $UNET_EPOCHS"
     echo "U-Net conv_h_dim: $UNET_CONV_H_DIM"
     echo "U-Net D: $UNET_D"
     echo "U-Net gamma: $UNET_GAMMA"
     echo "U-Net lr: $UNET_LR"
+    if [ "$ALGORITHM" == "semi_supervised_unet" ]; then
+        echo "Semi-supervised: mortality diffusion ENABLED"
+    fi
 fi
 if [ -n "$IRL_MODEL_PATH" ]; then
     echo "Pre-trained IRL model: $IRL_MODEL_PATH"
+fi
+if [ -n "$REWARD_COMBINE_LAMBDA" ]; then
+    echo "Reward combine lambda: $REWARD_COMBINE_LAMBDA"
+    echo "  Combined reward = (1-lambda)*manual + lambda*IRL"
 fi
 echo "=============================================="
 
@@ -250,6 +265,24 @@ else
                 exit 1
             fi
             ;;
+        semi_supervised_unet)
+            UNET_DIR="${EXPERIMENT_DIR}/semi_supervised_unet${SUFFIX}"
+            mkdir -p "$UNET_DIR"
+            python "${SCRIPT_DIR}/semi_supervised_unet_reward_generator.py" \
+                --epochs "$UNET_EPOCHS" \
+                --conv_h_dim "$UNET_CONV_H_DIM" \
+                --D "$UNET_D" \
+                --gamma "$UNET_GAMMA" \
+                --lr "$UNET_LR" \
+                --use_mortality_diffusion \
+                --experiment_dir "$UNET_DIR"
+            # Find the latest model
+            REWARD_MODEL_PATH=$(ls -t "${UNET_DIR}"_"${UNET_CONV_H_DIM}"/model_epoch_*.pt 2>/dev/null | head -1)
+            if [ -z "$REWARD_MODEL_PATH" ]; then
+                echo "Error: No semi-supervised U-Net model found in ${UNET_DIR}_${UNET_CONV_H_DIM}"
+                exit 1
+            fi
+            ;;
         *)
             echo "Unknown algorithm: $ALGORITHM"
             exit 1
@@ -265,27 +298,38 @@ echo "=============================================="
 echo "Step 2: Q-Learning Training"
 echo "=============================================="
 
-if [ -z "$REWARD_MODEL_PATH" ]; then
-    # Manual reward
-    python "${SCRIPT_DIR}/run_block_discrete_cql_allalphas.py" \
-        --single_alpha 0.0 \
-        --vp2_bins "$VP2_BINS" \
-        --epochs "$QL_EPOCHS" \
-        --suffix "${SUFFIX}" \
-        --save_dir "$QL_DIR"
+# Build Q-Learning command with optional parameters
+QL_CMD="python ${SCRIPT_DIR}/run_block_discrete_cql_allalphas.py \
+    --single_alpha 0.0 \
+    --vp2_bins $VP2_BINS \
+    --epochs $QL_EPOCHS \
+    --save_dir $QL_DIR"
+
+if [ -n "$SUFFIX" ]; then
+    QL_CMD="$QL_CMD --suffix $SUFFIX"
+fi
+
+if [ -n "$REWARD_MODEL_PATH" ]; then
+    QL_CMD="$QL_CMD --reward_model_path $REWARD_MODEL_PATH"
+fi
+
+if [ -n "$REWARD_COMBINE_LAMBDA" ]; then
+    QL_CMD="$QL_CMD --reward_combine_lambda $REWARD_COMBINE_LAMBDA"
+fi
+
+eval $QL_CMD
+
+# Determine the model prefix based on whether lambda is used
+if [ -n "$REWARD_COMBINE_LAMBDA" ]; then
+    # Remove trailing zeros from lambda for filename (e.g., 0.10 -> 0.1)
+    LAMBDA_STR=$(echo "$REWARD_COMBINE_LAMBDA" | sed 's/0*$//' | sed 's/\.$//')
+    MODEL_PREFIX="${ALGORITHM}_combined_manual_lambda${LAMBDA_STR}${SUFFIX}"
 else
-    # Learned reward
-    python "${SCRIPT_DIR}/run_block_discrete_cql_allalphas.py" \
-        --single_alpha 0.0 \
-        --vp2_bins "$VP2_BINS" \
-        --epochs "$QL_EPOCHS" \
-        --reward_model_path "$REWARD_MODEL_PATH" \
-        --suffix "${SUFFIX}" \
-        --save_dir "$QL_DIR"
+    MODEL_PREFIX="${ALGORITHM}${SUFFIX}"
 fi
 
 # Find the saved Q-learning model (alpha format is 0.0000)
-QL_MODEL_PATH="${QL_DIR}/${ALGORITHM}${SUFFIX}_alpha0.0000_bins${VP2_BINS}_best.pt"
+QL_MODEL_PATH="${QL_DIR}/${MODEL_PREFIX}_alpha0.0000_bins${VP2_BINS}_best.pt"
 echo "Q-Learning complete. Model saved to: $QL_MODEL_PATH"
 
 # Step 3: WIS Evaluation
@@ -295,7 +339,7 @@ echo "Step 3: WIS Evaluation"
 echo "=============================================="
 
 # Results file named after the model (alpha format is 0.0000)
-RESULTS_FILE="${RESULTS_DIR}/${ALGORITHM}${SUFFIX}_alpha0.0000_bins${VP2_BINS}_best_wis.txt"
+RESULTS_FILE="${RESULTS_DIR}/${MODEL_PREFIX}_alpha0.0000_bins${VP2_BINS}_best_wis.txt"
 
 python "${SCRIPT_DIR}/is_block_discrete.py" \
     --model_path "$QL_MODEL_PATH" \
