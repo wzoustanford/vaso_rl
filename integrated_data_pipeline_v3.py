@@ -21,6 +21,104 @@ from maxent_irl_full_recovery import RewardNetwork
 MIN_SEQ_LEN_UNET = 7
 
 
+def compute_outcome_reward_components(
+    states: np.ndarray,
+    actions: np.ndarray,
+    current_timestep: int,
+    is_terminal: bool,
+    mortality: int,
+    state_features: list
+) -> dict:
+    """
+    Compute reward components based on clinical outcomes.
+    Returns each component separately for analysis.
+
+    Args:
+        states: All states for this patient (T x num_features)
+        actions: All actions for this patient (T,) or (T x num_actions)
+        current_timestep: Current timestep index
+        is_terminal: Whether this is the last timestep
+        mortality: Whether patient died (1) or survived (0)
+        state_features: List of feature names for indexing
+
+    Returns:
+        Dict with keys: 'base', 'lactate', 'mbp', 'sofa', 'norepinephrine', 'mortality', 'total'
+    """
+    components = {
+        'base': 0.0,
+        'lactate': 0.0,
+        'mbp': 0.0,
+        'sofa': 0.0,
+        'norepinephrine': 0.0,
+        'mortality': 0.0,
+    }
+
+    # 1. Base reward for survival at each time point
+    components['base'] = 1.0
+
+    # Get indices for key features
+    mbp_idx = state_features.index('mbp') if 'mbp' in state_features else None
+    lactate_idx = state_features.index('lactate') if 'lactate' in state_features else None
+    sofa_idx = state_features.index('sofa') if 'sofa' in state_features else None
+    norepi_idx = state_features.index('norepinephrine') if 'norepinephrine' in state_features else None
+
+    state = states[current_timestep]
+
+    # 3a. Decreased lactate levels (check next 6 hours)
+    if lactate_idx is not None:
+        lactate_current = state[lactate_idx]
+        lookback_6hr = min(current_timestep + 6, len(states) - 1)
+        if lookback_6hr > current_timestep:
+            lactate_future = states[lookback_6hr][lactate_idx]
+            if lactate_future < lactate_current:
+                components['lactate'] = 1.0
+
+    # 3b. Increased MBP to >= 65 mmHg (check next 4 hours)
+    if mbp_idx is not None:
+        mbp_current = state[mbp_idx]
+        if mbp_current < 65:
+            lookback_4hr = min(current_timestep + 4, len(states) - 1)
+            if lookback_4hr > current_timestep:
+                mbp_future = states[lookback_4hr][mbp_idx]
+                if mbp_future >= 65:
+                    components['mbp'] = 1.0
+
+    # 3c. Decreased SOFA score (check next 6 hours)
+    if sofa_idx is not None:
+        sofa_current = state[sofa_idx]
+        lookback_6hr = min(current_timestep + 6, len(states) - 1)
+        if lookback_6hr > current_timestep:
+            sofa_future = states[lookback_6hr][sofa_idx]
+            if sofa_future < sofa_current:
+                components['sofa'] = 3.0
+
+    # 3d. Decreased norepinephrine usage (check next 4 hours)
+    if norepi_idx is not None:
+        norepi_current = state[norepi_idx]
+        lookback_4hr = min(current_timestep + 4, len(states) - 1)
+        if lookback_4hr > current_timestep:
+            norepi_future = states[lookback_4hr][norepi_idx]
+            if norepi_future < norepi_current:
+                components['norepinephrine'] = 1.0
+    elif actions.ndim > 1 and actions.shape[1] >= 2:
+        norepi_current = actions[current_timestep][1]
+        lookback_4hr = min(current_timestep + 4, len(actions) - 1)
+        if lookback_4hr > current_timestep:
+            norepi_future = actions[lookback_4hr][1]
+            if norepi_future < norepi_current:
+                components['norepinephrine'] = 1.0
+
+    # 2. Penalty for death in the last state
+    if is_terminal:
+        if mortality == 1:
+            components['mortality'] = -20.0
+
+    # Compute total
+    components['total'] = sum(components.values())
+
+    return components
+
+
 class IntegratedDataPipelineV3:
     """
     Data pipeline for CQL training using LEARNED rewards from IRL methods.
@@ -36,7 +134,8 @@ class IntegratedDataPipelineV3:
         self,
         model_type: str = 'dual',
         reward_source: str = 'learned',  # 'learned' or 'manual'
-        random_seed: int = config.RANDOM_SEED
+        random_seed: int = config.RANDOM_SEED,
+        reward_combine_lambda: Optional[float] = None
     ):
         """
         Initialize integrated pipeline with learned rewards.
@@ -45,10 +144,19 @@ class IntegratedDataPipelineV3:
             model_type: 'binary' or 'dual' for different CQL models
             reward_source: 'learned' (from IRL) or 'manual' (original compute_outcome_reward)
             random_seed: Random seed for reproducibility
+            reward_combine_lambda: If None, use pure IRL reward. If in [0, 1], use
+                (1 - lambda) * manual_reward + lambda * irl_reward.
+                Raises AssertionError if outside [0, 1] range.
         """
+        # Validate reward_combine_lambda if provided
+        if reward_combine_lambda is not None:
+            assert 0.0 <= reward_combine_lambda <= 1.0, \
+                f"reward_combine_lambda must be in [0, 1], got {reward_combine_lambda}"
+
         self.model_type = model_type
         self.reward_source = reward_source
         self.random_seed = random_seed
+        self.reward_combine_lambda = reward_combine_lambda
 
         # Initialize components
         self.loader = DataLoader(verbose=False, random_seed=random_seed)
@@ -191,6 +299,50 @@ class IntegratedDataPipelineV3:
         print(f"  state_size: {state_size}, action_size: {action_size}, conv_h_dim: {conv_h_dim}")
         print(f"  vp1_bins: {vp1_bins}, vp2_bins: {vp2_bins}")
         print(f"  Reward = per-timestep output from U-Net")
+
+    def load_semi_supervised_unet_reward_model(self, checkpoint_path: str, vp1_bins: int = 2, vp2_bins: int = 5):
+        """
+        Load Semi-Supervised U-Net model for reward computation.
+        Uses only the UNetRewardGenerator part (not the MortalityDiffuser).
+
+        Args:
+            checkpoint_path: Path to semi-supervised U-Net checkpoint (.pt file)
+            vp1_bins: Number of VP1 bins (default 2 for binary)
+            vp2_bins: Number of VP2 bins (default 5)
+        """
+        from semi_supervised_unet_reward_generator import UNetRewardGenerator
+
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        # Get model parameters from checkpoint
+        state_size = checkpoint.get('state_size')
+        action_size = checkpoint.get('action_size', vp1_bins * vp2_bins)
+        conv_h_dim = checkpoint.get('conv_h_dim', 64)
+
+        # Fallback: infer from model weights if not found
+        if state_size is None:
+            input_size = checkpoint['model_state_dict']['enc1.0.weight'].shape[1]
+            state_size = input_size - action_size
+
+        # Store U-Net specific parameters
+        self.unet_vp1_bins = vp1_bins
+        self.unet_vp2_bins = vp2_bins
+        self.unet_n_actions = vp1_bins * vp2_bins
+
+        # Initialize and load model (UNetRewardGenerator only, not MortalityDiffuser)
+        self.reward_model = UNetRewardGenerator(
+            state_size=state_size,
+            action_size=action_size,
+            conv_h_dim=conv_h_dim
+        ).to(self.device)
+        self.reward_model.load_state_dict(checkpoint['model_state_dict'])
+        self.reward_model_type = 'semi_supervised_unet'
+        self.reward_model.eval()
+
+        print(f"Loaded Semi-Supervised U-Net reward model from: {checkpoint_path}")
+        print(f"  state_size: {state_size}, action_size: {action_size}, conv_h_dim: {conv_h_dim}")
+        print(f"  vp1_bins: {vp1_bins}, vp2_bins: {vp2_bins}")
+        print(f"  Reward = per-timestep output from U-Net (semi-supervised)")
 
     def _continuous_to_discrete_action_unet(self, actions: np.ndarray) -> np.ndarray:
         """
@@ -415,8 +567,23 @@ class IntegratedDataPipelineV3:
 
                 # Initial reward (will be recomputed if using learned rewards)
                 if self.reward_source == 'learned':
-                    # Placeholder - will be recomputed after normalization
-                    reward = 0.0
+                    if self.reward_combine_lambda is not None:
+                        # Compute manual reward for later combination with IRL reward
+                        from integrated_data_pipeline_v2 import compute_outcome_reward
+                        reward = compute_outcome_reward(
+                            states, actions, t,
+                            is_terminal, mortality, state_features
+                        )
+                    else:
+                        # Placeholder - will be replaced by IRL reward after normalization
+                        reward = 0.0
+                elif self.reward_source == 'mortality_only':
+                    # Mortality-only reward: 1 for death at terminal, 0 otherwise
+                    # This is a sparse binary signal at the end of trajectory
+                    if is_terminal and mortality == 1:
+                        reward = 1.0  # Death penalty signal
+                    else:
+                        reward = 0.0
                 else:
                     # Use manual reward
                     from integrated_data_pipeline_v2 import compute_outcome_reward
@@ -477,6 +644,9 @@ class IntegratedDataPipelineV3:
 
         For U-Net: Process by trajectory since U-Net needs full sequences.
         For GCL/IQ-Learn/MaxEnt: Process in batches.
+
+        If reward_combine_lambda is set, combines manual and IRL rewards:
+            combined = (1 - lambda) * manual_reward + lambda * irl_reward
         """
         for split_name, data, patient_groups in [
             ('train', self.train_data, self.train_patient_groups),
@@ -487,9 +657,15 @@ class IntegratedDataPipelineV3:
                 continue
 
             n_transitions = data['n_transitions']
-            new_rewards = np.zeros(n_transitions, dtype=np.float32)
 
-            if self.reward_model_type == 'unet':
+            # Store manual rewards if combining (they were computed in _process_split)
+            manual_rewards = None
+            if self.reward_combine_lambda is not None:
+                manual_rewards = data['rewards'].copy()
+
+            irl_rewards = np.zeros(n_transitions, dtype=np.float32)
+
+            if self.reward_model_type in ('unet', 'semi_supervised_unet'):
                 # U-Net: Process by trajectory (patient)
                 # U-Net requires full trajectory context for reward prediction
                 print(f"   {split_name}: Processing {len(patient_groups)} patients for U-Net rewards...")
@@ -519,7 +695,7 @@ class IntegratedDataPipelineV3:
 
                     # Assign rewards to transitions
                     # trajectory_rewards has shape [seq_len-1], matching our transitions
-                    new_rewards[start_idx:end_idx] = trajectory_rewards
+                    irl_rewards[start_idx:end_idx] = trajectory_rewards
             else:
                 # GCL/IQ-Learn/MaxEnt: Process in batches
                 batch_size = 1024
@@ -534,10 +710,20 @@ class IntegratedDataPipelineV3:
                     rewards_batch = self._compute_learned_reward(
                         states_batch, actions_batch, next_states_batch, dones_batch
                     )
-                    new_rewards[start_idx:end_idx] = rewards_batch
+                    irl_rewards[start_idx:end_idx] = rewards_batch
 
-            data['rewards'] = new_rewards
-            print(f"   {split_name}: Reward range [{new_rewards.min():.3f}, {new_rewards.max():.3f}]")
+            # Combine manual and IRL rewards if lambda is set
+            if self.reward_combine_lambda is not None:
+                lam = self.reward_combine_lambda
+                combined_rewards = (1.0 - lam) * manual_rewards + lam * irl_rewards
+                data['rewards'] = combined_rewards
+                print(f"   {split_name}: Combined reward (lambda={lam:.2f}): "
+                      f"manual [{manual_rewards.min():.3f}, {manual_rewards.max():.3f}], "
+                      f"IRL [{irl_rewards.min():.3f}, {irl_rewards.max():.3f}] -> "
+                      f"combined [{combined_rewards.min():.3f}, {combined_rewards.max():.3f}]")
+            else:
+                data['rewards'] = irl_rewards
+                print(f"   {split_name}: IRL reward range [{irl_rewards.min():.3f}, {irl_rewards.max():.3f}]")
 
     def get_batch(self, batch_size: int = 256, split: str = 'train',
                   same_patient: bool = False, seed: Optional[int] = None) -> Dict:
@@ -639,6 +825,24 @@ class IntegratedDataPipelineV3:
     def reset_batch_rng(self):
         """Reset the internal random number generator"""
         self.rng = np.random.RandomState(self.random_seed)
+
+    def get_reward_prefix(self) -> str:
+        """
+        Get the reward model prefix identifier for experiment naming.
+
+        Returns:
+            - If reward_combine_lambda is None: just the reward_model_type (e.g., 'maxent')
+            - If reward_combine_lambda is set: e.g., 'maxent_combined_manual_lambda0.1'
+        """
+        if self.reward_model_type is None:
+            return 'manual'
+
+        if self.reward_combine_lambda is not None:
+            # Format lambda: use up to 2 decimal places, remove trailing zeros
+            lam_str = f"{self.reward_combine_lambda:.2f}".rstrip('0').rstrip('.')
+            return f"{self.reward_model_type}_combined_manual_lambda{lam_str}"
+        else:
+            return self.reward_model_type
 
 
 # ==================== Example Usage ====================

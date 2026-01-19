@@ -93,6 +93,10 @@ if reward_type == 'irl':
         pipeline.load_gcl_reward_model(irl_model_path)
     elif 'maxent' in irl_model_path.lower():
         pipeline.load_maxent_reward_model(irl_model_path)
+    elif 'semi_supervised_unet' in irl_model_path.lower():
+        pipeline.load_semi_supervised_unet_reward_model(irl_model_path, vp1_bins=2, vp2_bins=n_bins)
+    elif 'unet' in irl_model_path.lower():
+        pipeline.load_unet_reward_model(irl_model_path, vp1_bins=2, vp2_bins=n_bins)
     else:
         # Try to infer from file content or default to iq_learn
         print(f"Warning: Could not detect IRL model type from path, trying IQ-Learn...")
