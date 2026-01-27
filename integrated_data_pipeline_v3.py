@@ -15,7 +15,7 @@ from sklearn.preprocessing import StandardScaler
 import data_config as config
 from data_loader import DataLoader
 from data_loader import DataSplitter
-from maxent_irl_full_recovery import RewardNetwork
+# Note: RewardNetwork is imported lazily in load_maxent_reward_model to avoid circular import
 
 # Minimum sequence length for U-Net (3 conv layers each shrink by 2)
 MIN_SEQ_LEN_UNET = 7
@@ -135,7 +135,9 @@ class IntegratedDataPipelineV3:
         model_type: str = 'dual',
         reward_source: str = 'learned',  # 'learned' or 'manual'
         random_seed: int = config.RANDOM_SEED,
-        reward_combine_lambda: Optional[float] = None
+        reward_combine_lambda: Optional[float] = None,
+        combined_or_train_data_path: Optional[str] = None,
+        eval_data_path: Optional[str] = None
     ):
         """
         Initialize integrated pipeline with learned rewards.
@@ -147,6 +149,32 @@ class IntegratedDataPipelineV3:
             reward_combine_lambda: If None, use pure IRL reward. If in [0, 1], use
                 (1 - lambda) * manual_reward + lambda * irl_reward.
                 Raises AssertionError if outside [0, 1] range.
+            combined_or_train_data_path: Path to dataset. If None, uses config.DATA_PATH.
+                - In single-dataset mode: this dataset is split into train/val/test
+                - In dual-dataset mode: all patients from this dataset used for training
+            eval_data_path: Path to evaluation dataset (for val/test). If None, uses
+                single-dataset mode. If provided, splits this dataset into val/test (50/50).
+
+        Dataset modes:
+            1. Single-dataset mode (default): eval_data_path=None
+               Uses combined_or_train_data_path, splits into train/val/test (70/15/15).
+
+            2. Dual-dataset mode: eval_data_path provided
+               - All patients from combined_or_train_data_path used for training
+               - Patients from eval_data_path split into val/test (50/50)
+
+        Example usage for cross-dataset evaluation:
+            # Train on OVISS, evaluate on UPMC
+            pipeline = IntegratedDataPipelineV3(
+                combined_or_train_data_path='sample_data_oviss.csv',
+                eval_data_path='oviss_sample_upmc.csv'
+            )
+
+            # Train on UPMC, evaluate on OVISS (swap roles)
+            pipeline = IntegratedDataPipelineV3(
+                combined_or_train_data_path='oviss_sample_upmc.csv',
+                eval_data_path='sample_data_oviss.csv'
+            )
         """
         # Validate reward_combine_lambda if provided
         if reward_combine_lambda is not None:
@@ -158,8 +186,24 @@ class IntegratedDataPipelineV3:
         self.random_seed = random_seed
         self.reward_combine_lambda = reward_combine_lambda
 
+        # Dataset configuration
+        self.combined_or_train_data_path = combined_or_train_data_path if combined_or_train_data_path else config.DATA_PATH
+        self.eval_data_path = eval_data_path
+        self.dual_dataset_mode = eval_data_path is not None
+
         # Initialize components
-        self.loader = DataLoader(verbose=False, random_seed=random_seed)
+        self.loader = DataLoader(
+            data_path=self.combined_or_train_data_path,
+            verbose=False,
+            random_seed=random_seed
+        )
+        self.eval_loader = None
+        if self.dual_dataset_mode:
+            self.eval_loader = DataLoader(
+                data_path=self.eval_data_path,
+                verbose=False,
+                random_seed=random_seed
+            )
         self.splitter = DataSplitter(random_seed=random_seed)
 
         # Scaler for state normalization
@@ -234,6 +278,9 @@ class IntegratedDataPipelineV3:
         Args:
             checkpoint_path: Path to MaxEnt IRL checkpoint (.pt file)
         """
+        # Lazy import to avoid circular dependency
+        from maxent_irl_full_recovery import RewardNetwork
+
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
         state_dim = checkpoint['state_dim']
@@ -472,26 +519,26 @@ class IntegratedDataPipelineV3:
         """
         Complete data preparation pipeline producing (s, a, r, s', done) tuples.
         Uses learned rewards if reward_source='learned' and a model is loaded.
+
+        In single-dataset mode:
+            - Splits combined_or_train_data_path into train/val/test (70/15/15)
+
+        In dual-dataset mode:
+            - All patients from combined_or_train_data_path used for training
+            - Patients from eval_data_path split into val/test (50/50)
         """
         print(f"Preparing {self.model_type.upper()} CQL data pipeline V3...")
         print(f"Reward source: {self.reward_source}")
         if self.reward_model_type:
             print(f"Reward model: {self.reward_model_type}")
+        if self.dual_dataset_mode:
+            print(f"Dataset mode: DUAL-DATASET")
+            print(f"  Train data: {self.combined_or_train_data_path}")
+            print(f"  Eval data:  {self.eval_data_path}")
+        else:
+            print(f"Dataset mode: SINGLE-DATASET")
+            print(f"  Data path: {self.combined_or_train_data_path}")
         print("="*60)
-
-        # Load and split data
-        print("1. Loading and splitting data...")
-        full_data = self.loader.load_data()
-        patient_ids = self.loader.get_patient_ids()
-        train_patients, val_patients, test_patients = self.splitter.split_patients(patient_ids)
-
-        print(f"   Train: {len(train_patients)} patients")
-        print(f"   Val:   {len(val_patients)} patients")
-        print(f"   Test:  {len(test_patients)} patients")
-
-        # Encode categorical features
-        print("2. Encoding categorical features...")
-        self.loader.encode_categorical_features()
 
         # Get feature lists based on model type
         if self.model_type == 'binary':
@@ -499,16 +546,66 @@ class IntegratedDataPipelineV3:
         else:
             state_features = config.DUAL_STATE_FEATURES
 
-        # Process each split separately
-        print("3. Processing transitions...")
+        if self.dual_dataset_mode:
+            # DUAL-DATASET MODE
+            # Load training data (use all patients)
+            print("1. Loading training data...")
+            self.loader.load_data()
+            train_patients = self.loader.get_patient_ids()
+            print(f"   Train: {len(train_patients)} patients (all from {self.combined_or_train_data_path})")
 
-        self.train_data = self._process_split(train_patients, state_features, 'train')
-        self.val_data = self._process_split(val_patients, state_features, 'val')
-        self.test_data = self._process_split(test_patients, state_features, 'test')
+            # Load evaluation data (split into val/test)
+            print("2. Loading evaluation data...")
+            self.eval_loader.load_data()
+            eval_patient_ids = self.eval_loader.get_patient_ids()
+
+            # Split eval data 50/50 into val and test
+            val_patients, test_patients = self.splitter.split_patients(
+                eval_patient_ids,
+                train_ratio=0.0,
+                val_ratio=0.5,
+                test_ratio=0.5
+            )[1:]  # Skip empty train split
+
+            print(f"   Val:   {len(val_patients)} patients (from {self.eval_data_path})")
+            print(f"   Test:  {len(test_patients)} patients (from {self.eval_data_path})")
+
+            # Encode categorical features for both loaders
+            print("3. Encoding categorical features...")
+            self.loader.encode_categorical_features()
+            self.eval_loader.encode_categorical_features()
+
+            # Process each split
+            print("4. Processing transitions...")
+            self.train_data = self._process_split(train_patients, state_features, 'train', self.loader)
+            self.val_data = self._process_split(val_patients, state_features, 'val', self.eval_loader)
+            self.test_data = self._process_split(test_patients, state_features, 'test', self.eval_loader)
+
+        else:
+            # SINGLE-DATASET MODE (original behavior)
+            print("1. Loading and splitting data...")
+            self.loader.load_data()
+            patient_ids = self.loader.get_patient_ids()
+            train_patients, val_patients, test_patients = self.splitter.split_patients(patient_ids)
+
+            print(f"   Train: {len(train_patients)} patients")
+            print(f"   Val:   {len(val_patients)} patients")
+            print(f"   Test:  {len(test_patients)} patients")
+
+            # Encode categorical features
+            print("2. Encoding categorical features...")
+            self.loader.encode_categorical_features()
+
+            # Process each split separately
+            print("3. Processing transitions...")
+            self.train_data = self._process_split(train_patients, state_features, 'train', self.loader)
+            self.val_data = self._process_split(val_patients, state_features, 'val', self.loader)
+            self.test_data = self._process_split(test_patients, state_features, 'test', self.loader)
 
         # If using learned rewards, recompute rewards now that data is normalized
         if self.reward_source == 'learned' and self.reward_model is not None:
-            print("4. Computing learned rewards...")
+            step_num = "5" if self.dual_dataset_mode else "4"
+            print(f"{step_num}. Computing learned rewards...")
             self._recompute_learned_rewards()
 
         print("\n Data pipeline complete!")
@@ -516,10 +613,16 @@ class IntegratedDataPipelineV3:
 
         return self.train_data, self.val_data, self.test_data
 
-    def _process_split(self, patient_list: np.ndarray, state_features: list, split_name: str) -> Dict:
+    def _process_split(self, patient_list: np.ndarray, state_features: list, split_name: str, loader: DataLoader) -> Dict:
         """
         Process a data split to create (s, a, r, s', done) tuples.
         Initial rewards are set to 0 if using learned rewards (recomputed later).
+
+        Args:
+            patient_list: Array of patient IDs to process
+            state_features: List of state feature column names
+            split_name: Name of split ('train', 'val', or 'test')
+            loader: DataLoader instance to use for getting patient data
         """
         all_states = []
         all_actions = []
@@ -533,7 +636,7 @@ class IntegratedDataPipelineV3:
         current_idx = 0
 
         for patient_id in patient_list:
-            patient_data = self.loader.get_patient_data(patient_id)
+            patient_data = loader.get_patient_data(patient_id)
 
             if len(patient_data) < 2:  # Need at least 2 timesteps
                 continue
@@ -803,6 +906,13 @@ class IntegratedDataPipelineV3:
         print("\n" + "="*60)
         print("DATA SUMMARY")
         print("="*60)
+        if self.dual_dataset_mode:
+            print(f"Dataset mode: DUAL-DATASET")
+            print(f"  Train source: {self.combined_or_train_data_path}")
+            print(f"  Eval source:  {self.eval_data_path}")
+        else:
+            print(f"Dataset mode: SINGLE-DATASET")
+            print(f"  Data source: {self.combined_or_train_data_path}")
         print(f"Reward source: {self.reward_source}")
         if self.reward_model_type:
             print(f"Reward model: {self.reward_model_type}")
@@ -852,8 +962,8 @@ if __name__ == "__main__":
     print(" INTEGRATED DATA PIPELINE V3 - WITH LEARNED REWARDS")
     print("="*70)
 
-    # Example 1: Using manual rewards (same as V2)
-    print("\n--- MANUAL REWARDS (baseline) ---\n")
+    # Example 1: Single-dataset mode with manual rewards (same as V2)
+    print("\n--- SINGLE-DATASET MODE: MANUAL REWARDS (baseline) ---\n")
     pipeline_manual = IntegratedDataPipelineV3(
         model_type='dual',
         reward_source='manual',
@@ -861,7 +971,31 @@ if __name__ == "__main__":
     )
     train_data, val_data, test_data = pipeline_manual.prepare_data()
 
-    # Example 2: Using GCL learned rewards
+    # Example 2: Dual-dataset mode - Train on OVISS, evaluate on UPMC
+    print("\n--- DUAL-DATASET MODE: Train on OVISS, Eval on UPMC ---\n")
+    # Uncomment when oviss_sample_upmc.csv is available:
+    # pipeline_dual = IntegratedDataPipelineV3(
+    #     model_type='dual',
+    #     reward_source='manual',
+    #     random_seed=42,
+    #     combined_or_train_data_path='sample_data_oviss.csv',
+    #     eval_data_path='oviss_sample_upmc.csv'
+    # )
+    # train_data, val_data, test_data = pipeline_dual.prepare_data()
+
+    # Example 3: Dual-dataset mode - Train on UPMC, evaluate on OVISS (swapped)
+    print("\n--- DUAL-DATASET MODE: Train on UPMC, Eval on OVISS (swapped) ---\n")
+    # Uncomment when oviss_sample_upmc.csv is available:
+    # pipeline_swapped = IntegratedDataPipelineV3(
+    #     model_type='dual',
+    #     reward_source='manual',
+    #     random_seed=42,
+    #     combined_or_train_data_path='oviss_sample_upmc.csv',
+    #     eval_data_path='sample_data_oviss.csv'
+    # )
+    # train_data, val_data, test_data = pipeline_swapped.prepare_data()
+
+    # Example 4: Using GCL learned rewards
     print("\n--- GCL LEARNED REWARDS ---\n")
     pipeline_gcl = IntegratedDataPipelineV3(
         model_type='dual',
@@ -877,3 +1011,8 @@ if __name__ == "__main__":
     print("  1. Train GCL/IQ-Learn model")
     print("  2. Call pipeline.load_gcl_reward_model(path) or load_iq_learn_reward_model(path)")
     print("  3. Call pipeline.prepare_data()")
+
+    print("\nTo use dual-dataset mode:")
+    print("  1. Specify combined_or_train_data_path (used for training)")
+    print("  2. Specify eval_data_path (split 50/50 into val/test)")
+    print("  3. Swap the paths to reverse train/eval roles")

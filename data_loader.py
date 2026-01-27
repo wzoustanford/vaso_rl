@@ -331,46 +331,60 @@ class DataSplitter:
         np.random.seed(self.random_seed)
         random.seed(self.random_seed)
         
-    def split_patients(self, patient_ids: np.ndarray, 
+    def split_patients(self, patient_ids: np.ndarray,
                       train_ratio: float = config.TRAIN_RATIO,
                       val_ratio: float = config.VAL_RATIO,
                       test_ratio: float = config.TEST_RATIO) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Split patient IDs into train/val/test sets
-        
+
         Args:
             patient_ids: Array of all patient IDs
             train_ratio: Proportion for training (default 0.70)
             val_ratio: Proportion for validation (default 0.15)
             test_ratio: Proportion for testing (default 0.15)
-            
+
         Returns:
             Tuple of (train_patients, val_patients, test_patients)
         """
         assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, \
             "Ratios must sum to 1.0"
-        
-        # First split: train+val vs test
-        train_val_patients, test_patients = train_test_split(
-            patient_ids,
-            test_size=test_ratio,
-            random_state=self.random_seed
-        )
-        
-        # Second split: train vs val
-        # Calculate validation size relative to train+val
-        val_size_relative = val_ratio / (train_ratio + val_ratio)
-        
-        train_patients, val_patients = train_test_split(
-            train_val_patients,
-            test_size=val_size_relative,
-            random_state=self.random_seed
-        )
-        
+
+        # Special case: train_ratio=0.0 means we only want val and test splits
+        # (used in dual-dataset mode where all train data comes from another dataset)
+        if train_ratio == 0.0:
+            # Split directly into val and test
+            # test_ratio / (val_ratio + test_ratio) gives relative test size
+            relative_test_size = test_ratio / (val_ratio + test_ratio)
+            val_patients, test_patients = train_test_split(
+                patient_ids,
+                test_size=relative_test_size,
+                random_state=self.random_seed
+            )
+            train_patients = np.array([])  # Empty train set
+        else:
+            # Standard two-step split
+            # First split: train+val vs test
+            train_val_patients, test_patients = train_test_split(
+                patient_ids,
+                test_size=test_ratio,
+                random_state=self.random_seed
+            )
+
+            # Second split: train vs val
+            # Calculate validation size relative to train+val
+            val_size_relative = val_ratio / (train_ratio + val_ratio)
+
+            train_patients, val_patients = train_test_split(
+                train_val_patients,
+                test_size=val_size_relative,
+                random_state=self.random_seed
+            )
+
         self.train_patients = train_patients
         self.val_patients = val_patients
         self.test_patients = test_patients
-        
+
         return train_patients, val_patients, test_patients
     
     def get_split_data(self, data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:

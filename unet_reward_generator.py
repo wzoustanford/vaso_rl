@@ -52,6 +52,8 @@ class Config:
         for key, value in kwargs.items():
             if hasattr(self, key):
                 setattr(self, key, value)
+        # Recalculate action_size based on current vp1_bins and vp2_bins
+        self.action_size = self.vp1_bins * self.vp2_bins
 
 ## U-Net Architecture for Variable-Length Sequence Reward Generation
 class UNetRewardGenerator(nn.Module):
@@ -245,6 +247,19 @@ def compute_training_step(
          for t in range(seq_len)]
         for b in range(batch_size)
     ], device=device)
+
+    # Debug: Check action indices are within bounds
+    max_idx = expert_action_idx.max().item()
+    min_idx = expert_action_idx.min().item()
+    if max_idx >= action_size or min_idx < 0:
+        print(f"ERROR: Action index out of bounds! max_idx={max_idx}, min_idx={min_idx}, action_size={action_size}")
+        print(f"  config.vp2_bins={config.vp2_bins}, converter.vp2_bins={converter.vp2_bins}")
+        print(f"  converter.total_actions={converter.total_actions}")
+        # Sample some actions to debug
+        sample_actions = actions[0, :5].cpu().numpy()
+        print(f"  Sample actions: {sample_actions}")
+        sample_indices = [converter.continuous_to_discrete_action(actions[0, t].cpu().numpy()) for t in range(5)]
+        print(f"  Sample indices: {sample_indices}")
 
     # --- Block 6b-4, 6b-5: Compute Q values and loss ---
     D = config.D
@@ -581,7 +596,8 @@ def main():
 
     print(f"Config: epochs={config.num_epochs}, batch_size={config.batch_size}, "
           f"lr={config.learning_rate}, conv_h_dim={config.conv_h_dim}, "
-          f"D={config.D}, gamma={config.gamma}")
+          f"D={config.D}, gamma={config.gamma}, "
+          f"vp1_bins={config.vp1_bins}, vp2_bins={config.vp2_bins}, action_size={config.action_size}")
 
     # Initialize data pipeline (use manual rewards - we generate our own via U-Net)
     print("Initializing data pipeline...")

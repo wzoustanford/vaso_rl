@@ -52,6 +52,8 @@ class Config:
         for key, value in kwargs.items():
             if hasattr(self, key):
                 setattr(self, key, value)
+        # Recalculate action_size based on current vp1_bins and vp2_bins
+        self.action_size = self.vp1_bins * self.vp2_bins
 
 ## U-Net Architecture for Variable-Length Sequence Reward Generation
 class UNetRewardGenerator(nn.Module):
@@ -567,6 +569,12 @@ def main():
     parser.add_argument('--vp2_bins', type=int, default=5, help='VP2 bins')
     parser.add_argument('--experiment_dir', type=str, default='experiments/unet_reward_gen',
                        help='Directory to save models')
+    parser.add_argument('--combined_or_train_data_path', type=str, default=None,
+                       help='Path to training dataset. If eval_data_path is also provided, '
+                            'all patients from this dataset are used for training.')
+    parser.add_argument('--eval_data_path', type=str, default=None,
+                       help='Path to evaluation dataset (for val/test). If provided, enables '
+                            'dual-dataset mode where this dataset is split 50/50 into val/test.')
     args = parser.parse_args()
 
     # Initialize config from command line args
@@ -584,14 +592,24 @@ def main():
 
     print(f"Config: epochs={config.num_epochs}, batch_size={config.batch_size}, "
           f"lr={config.learning_rate}, conv_h_dim={config.conv_h_dim}, "
-          f"D={config.D}, gamma={config.gamma}")
+          f"D={config.D}, gamma={config.gamma}, "
+          f"vp1_bins={config.vp1_bins}, vp2_bins={config.vp2_bins}, action_size={config.action_size}")
 
     # Initialize data pipeline (use manual rewards - we generate our own via U-Net)
     print("Initializing data pipeline...")
+    if args.eval_data_path:
+        print(f"  Dataset mode: DUAL-DATASET")
+        print(f"    Train data: {args.combined_or_train_data_path or 'default'}")
+        print(f"    Eval data:  {args.eval_data_path}")
+    else:
+        print(f"  Dataset mode: SINGLE-DATASET")
+        print(f"    Data path: {args.combined_or_train_data_path or 'default'}")
     pipeline = IntegratedDataPipelineV3(
         model_type='dual',
         reward_source='manual',
-        random_seed=42
+        random_seed=42,
+        combined_or_train_data_path=args.combined_or_train_data_path,
+        eval_data_path=args.eval_data_path
     )
 
     # Train model
