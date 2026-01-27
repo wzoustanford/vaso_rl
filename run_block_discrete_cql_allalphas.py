@@ -329,14 +329,34 @@ def train_block_discrete_cql(
     reward_model_path: str = None,
     suffix: str = "",
     save_dir: str = "experiment/ql",
-    reward_combine_lambda: float = None
+    reward_combine_lambda: float = None,
+    combined_or_train_data_path: str = None,
+    eval_data_path: str = None,
+    irl_vp2_bins: int = None
 ):
     """Train Block Discrete CQL with specified alpha and optional learned reward
 
     Args:
+        alpha: CQL penalty strength
+        vp2_bins: Number of bins for VP2 discretization (for Q-learning action space)
+        epochs: Number of training epochs
+        reward_model_path: Path to learned reward model (gcl/iq_learn/maxent/unet)
+        suffix: Suffix to add to experiment prefix
+        save_dir: Directory to save models
         reward_combine_lambda: If None, use pure IRL reward. If in [0, 1], use
             (1 - lambda) * manual_reward + lambda * irl_reward.
+        combined_or_train_data_path: Path to training dataset. If eval_data_path is
+            also provided, all patients are used for training. Otherwise split into
+            train/val/test. If None, uses default config.DATA_PATH.
+        eval_data_path: Path to evaluation dataset. If provided, enables dual-dataset
+            mode where this dataset is split 50/50 into val/test.
+        irl_vp2_bins: Number of VP2 bins used to train the IRL model. If None, uses
+            the same value as vp2_bins. This allows loading an IRL model trained with
+            different discretization than the Q-learning action space.
     """
+    # Determine IRL model vp2_bins (default to vp2_bins if not specified)
+    if irl_vp2_bins is None:
+        irl_vp2_bins = vp2_bins
 
     # Create save directory
     os.makedirs(save_dir, exist_ok=True)
@@ -345,26 +365,36 @@ def train_block_discrete_cql(
     print("\nInitializing Block Discrete CQL data pipeline...", flush=True)
     if reward_model_path is None:
         reward_type = "manual"
-        pipeline = IntegratedDataPipelineV2(model_type='dual', random_seed=42)
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='manual', random_seed=42,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
+        )
     elif 'gcl' in reward_model_path:
         reward_type = "gcl"
         pipeline = IntegratedDataPipelineV3(
             model_type='dual', reward_source='learned', random_seed=42,
-            reward_combine_lambda=reward_combine_lambda
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
         )
         pipeline.load_gcl_reward_model(reward_model_path)
     elif 'iq_learn' in reward_model_path:
         reward_type = "iq_learn"
         pipeline = IntegratedDataPipelineV3(
             model_type='dual', reward_source='learned', random_seed=42,
-            reward_combine_lambda=reward_combine_lambda
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
         )
         pipeline.load_iq_learn_reward_model(reward_model_path)
     elif 'maxent' in reward_model_path:
         reward_type = "maxent"
         pipeline = IntegratedDataPipelineV3(
             model_type='dual', reward_source='learned', random_seed=42,
-            reward_combine_lambda=reward_combine_lambda
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
         )
         pipeline.load_maxent_reward_model(reward_model_path)
     elif 'semi_supervised_unet' in reward_model_path:
@@ -372,20 +402,27 @@ def train_block_discrete_cql(
         reward_type = "semi_supervised_unet"
         pipeline = IntegratedDataPipelineV3(
             model_type='dual', reward_source='learned', random_seed=42,
-            reward_combine_lambda=reward_combine_lambda
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
         )
         # Load Semi-supervised U-Net model (uses only UNetRewardGenerator, not MortalityDiffuser)
-        pipeline.load_semi_supervised_unet_reward_model(reward_model_path, vp1_bins=2, vp2_bins=vp2_bins)
+        # Use irl_vp2_bins for loading (IRL model's action space), not vp2_bins (Q-learning action space)
+        pipeline.load_semi_supervised_unet_reward_model(reward_model_path, vp1_bins=2, vp2_bins=irl_vp2_bins)
+        print(f"  IRL model vp2_bins: {irl_vp2_bins}, Q-learning vp2_bins: {vp2_bins}")
     elif 'unet' in reward_model_path:
         # U-Net provides learned rewards via per-trajectory inference
         reward_type = "unet"
         pipeline = IntegratedDataPipelineV3(
             model_type='dual', reward_source='learned', random_seed=42,
-            reward_combine_lambda=reward_combine_lambda
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
         )
-        # Load U-Net model with default vp1_bins=2, vp2_bins=5
-        # TODO: Read vp2_bins from checkpoint or command line args
-        pipeline.load_unet_reward_model(reward_model_path, vp1_bins=2, vp2_bins=vp2_bins)
+        # Load U-Net model - use irl_vp2_bins for the IRL model's action space
+        # This allows the IRL model to have different discretization than Q-learning
+        pipeline.load_unet_reward_model(reward_model_path, vp1_bins=2, vp2_bins=irl_vp2_bins)
+        print(f"  IRL model vp2_bins: {irl_vp2_bins}, Q-learning vp2_bins: {vp2_bins}")
     else:
         raise ValueError(f"Cannot infer reward model type from path: {reward_model_path}")
 
@@ -552,6 +589,17 @@ def main():
     parser.add_argument('--reward_combine_lambda', type=float, default=None,
                        help='Lambda for combining manual and IRL rewards: '
                             '(1-lambda)*manual + lambda*IRL. None=pure IRL reward.')
+    parser.add_argument('--combined_or_train_data_path', type=str, default=None,
+                       help='Path to training dataset. If eval_data_path is also provided, '
+                            'all patients from this dataset are used for training. '
+                            'If eval_data_path is None, this dataset is split into train/val/test.')
+    parser.add_argument('--eval_data_path', type=str, default=None,
+                       help='Path to evaluation dataset (for val/test). If provided, enables '
+                            'dual-dataset mode where this dataset is split 50/50 into val/test.')
+    parser.add_argument('--irl_vp2_bins', type=int, default=None,
+                       help='Number of VP2 bins used to train the IRL model. If None, uses '
+                            'the same value as --vp2_bins. This allows loading an IRL model '
+                            'trained with different discretization than the Q-learning action space.')
     args = parser.parse_args()
 
     # Determine alpha values to use
@@ -565,9 +613,14 @@ def main():
     print("="*70, flush=True)
     print(" BLOCK DISCRETE CQL TRAINING", flush=True)
     print("="*70, flush=True)
+    # Determine IRL model vp2_bins
+    irl_vp2_bins = args.irl_vp2_bins if args.irl_vp2_bins is not None else vp2_bins
+
     print("\nConfiguration:", flush=True)
     print("  - VP1: Binary (0 or 1)", flush=True)
     print(f"  - VP2: Discretized into {vp2_bins} bins (0 to 0.5 mcg/kg/min)", flush=True)
+    if args.irl_vp2_bins is not None and args.irl_vp2_bins != vp2_bins:
+        print(f"  - IRL model VP2 bins: {irl_vp2_bins} (different from Q-learning)", flush=True)
     print(f"  - Alpha values: {alphas}", flush=True)
     print(f"  - Epochs: {args.epochs}", flush=True)
     print(f"  - Reward model: {args.reward_model_path or 'manual'}", flush=True)
@@ -575,6 +628,13 @@ def main():
     print(f"  - Suffix: {args.suffix}", flush=True)
     print("  - Consistent hyperparameters (tau=0.8, lr=1e-3)", flush=True)
     print(f"  - Total discrete actions: {2 * vp2_bins}", flush=True)
+    if args.eval_data_path:
+        print(f"  - Dataset mode: DUAL-DATASET", flush=True)
+        print(f"    Train data: {args.combined_or_train_data_path or 'default'}", flush=True)
+        print(f"    Eval data:  {args.eval_data_path}", flush=True)
+    else:
+        print(f"  - Dataset mode: SINGLE-DATASET", flush=True)
+        print(f"    Data path: {args.combined_or_train_data_path or 'default'}", flush=True)
 
     # Train with different alpha values
     experiment_prefixes = []
@@ -587,7 +647,10 @@ def main():
             reward_model_path=args.reward_model_path,
             suffix=args.suffix,
             save_dir=args.save_dir,
-            reward_combine_lambda=args.reward_combine_lambda
+            reward_combine_lambda=args.reward_combine_lambda,
+            combined_or_train_data_path=args.combined_or_train_data_path,
+            eval_data_path=args.eval_data_path,
+            irl_vp2_bins=irl_vp2_bins
         )
         experiment_prefixes.append(exp_prefix)
 

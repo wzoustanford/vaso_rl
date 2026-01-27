@@ -28,7 +28,7 @@ import sys
 from typing import Dict, Tuple, Optional
 
 # Import our unified pipeline
-from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
+from integrated_data_pipeline_v3 import IntegratedDataPipelineV3
 
 # Force unbuffered output
 sys.stdout = sys.__stdout__
@@ -506,7 +506,9 @@ def train_gcl(
     lr: float = 1e-4,
     cost_lr: float = 1e-2,
     experiment_prefix: str = "gcl",
-    save_dir: str = "experiment/gcl"
+    save_dir: str = "experiment/gcl",
+    combined_or_train_data_path: str = None,
+    eval_data_path: str = None
 ):
     """Train GCL agent for inverse RL cost/reward recovery."""
 
@@ -520,7 +522,19 @@ def train_gcl(
 
     # Initialize data pipeline
     print("\nInitializing data pipeline...", flush=True)
-    pipeline = IntegratedDataPipelineV2(model_type='dual', random_seed=42)
+    if eval_data_path:
+        print(f"  Dataset mode: DUAL-DATASET", flush=True)
+        print(f"    Train data: {combined_or_train_data_path or 'default'}", flush=True)
+        print(f"    Eval data:  {eval_data_path}", flush=True)
+    else:
+        print(f"  Dataset mode: SINGLE-DATASET", flush=True)
+        print(f"    Data path: {combined_or_train_data_path or 'default'}", flush=True)
+    pipeline = IntegratedDataPipelineV3(
+        model_type='dual',
+        random_seed=42,
+        combined_or_train_data_path=combined_or_train_data_path,
+        eval_data_path=eval_data_path
+    )
     train_data, val_data, test_data = pipeline.prepare_data()
 
     state_dim = train_data['states'].shape[1]
@@ -684,6 +698,12 @@ def main():
     parser.add_argument('--cost_lr', type=float, default=1e-2)
     parser.add_argument('--prefix', type=str, default='gcl')
     parser.add_argument('--save_dir', type=str, default='experiment/gcl')
+    parser.add_argument('--combined_or_train_data_path', type=str, default=None,
+                       help='Path to training dataset. If eval_data_path is also provided, '
+                            'all patients from this dataset are used for training.')
+    parser.add_argument('--eval_data_path', type=str, default=None,
+                       help='Path to evaluation dataset (for val/test). If provided, enables '
+                            'dual-dataset mode where this dataset is split 50/50 into val/test.')
 
     args = parser.parse_args()
 
@@ -705,7 +725,9 @@ def main():
         lr=args.lr,
         cost_lr=args.cost_lr,
         experiment_prefix=args.prefix,
-        save_dir=args.save_dir
+        save_dir=args.save_dir,
+        combined_or_train_data_path=args.combined_or_train_data_path,
+        eval_data_path=args.eval_data_path
     )
 
     print("\n" + "=" * 70, flush=True)

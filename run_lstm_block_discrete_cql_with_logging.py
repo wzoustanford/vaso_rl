@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Dict, Tuple
 
 # Import our components
-from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
+from integrated_data_pipeline_v3 import IntegratedDataPipelineV3
 from medical_sequence_buffer import MedicalSequenceBuffer, SequenceDataLoader
 from lstm_block_discrete_cql_network import LSTMBlockDiscreteCQL
 from fqe_gaussian_analysis import FQEGaussianAnalysis, save_histogram_plot, save_q_values_to_pickle
@@ -126,13 +126,61 @@ def train_lstm_block_discrete_cql(
     buffer_capacity: int = 50000,
     save_dir: str = 'experiment',
     log_dir: str = 'logs',
-    log_every: int = 1  # Log every epoch
+    log_every: int = 1,  # Log every epoch
+    reward_model_path: str = None,
+    suffix: str = "",
+    reward_combine_lambda: float = None,
+    combined_or_train_data_path: str = None,
+    eval_data_path: str = None,
+    irl_vp2_bins: int = None
 ):
     """
     Train LSTM-based Block Discrete CQL with VP1 x VP2 discrete action space.
     VP1: Binary vasopressin (0 or 1)
     VP2: Discretized norepinephrine into bins (0 to 0.5 mcg/kg/min)
+
+    Args:
+        alpha: CQL penalty strength
+        vp2_bins: Number of bins for VP2 discretization (for Q-learning action space)
+        sequence_length: Total sequence length for LSTM
+        burn_in_length: Number of steps for burn-in (hidden state warm-up)
+        overlap: Overlap between consecutive sequences
+        hidden_dim: Hidden dimension for MLP layers
+        lstm_hidden: Hidden dimension for LSTM layers
+        num_lstm_layers: Number of LSTM layers
+        batch_size: Training batch size
+        epochs: Number of training epochs
+        learning_rate: Learning rate
+        tau: Soft update coefficient for target networks
+        gamma: Discount factor
+        grad_clip: Gradient clipping value
+        buffer_capacity: Replay buffer capacity
+        save_dir: Directory to save models
+        log_dir: Directory to save logs
+        log_every: Log every N epochs
+        reward_model_path: Path to learned reward model (gcl/iq_learn/maxent/unet)
+        suffix: Suffix to add to experiment prefix
+        reward_combine_lambda: If None, use pure IRL reward. If in [0, 1], use
+            (1 - lambda) * manual_reward + lambda * irl_reward.
+        combined_or_train_data_path: Path to training dataset. If eval_data_path is
+            also provided, all patients are used for training. Otherwise split into
+            train/val/test. If None, uses default config.DATA_PATH.
+        eval_data_path: Path to evaluation dataset. If provided, enables dual-dataset
+            mode where this dataset is split 50/50 into val/test.
+        irl_vp2_bins: Number of VP2 bins used to train the IRL model. If None, uses
+            the same value as vp2_bins. This allows loading an IRL model trained with
+            different discretization than the Q-learning action space.
+
+    Returns:
+        agent: Trained LSTMBlockDiscreteCQL agent
+        train_buffer: Training sequence buffer
+        val_buffer: Validation sequence buffer
+        training_history: Dictionary with training metrics
+        experiment_prefix: Prefix used for saving models
     """
+    # Determine IRL model vp2_bins (default to vp2_bins if not specified)
+    if irl_vp2_bins is None:
+        irl_vp2_bins = vp2_bins
     # Create directories
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
@@ -151,12 +199,83 @@ def train_lstm_block_discrete_cql(
     
     logger.log("="*70)
     logger.log(f" LSTM BLOCK DISCRETE CQL TRAINING WITH ALPHA={alpha}, VP2_BINS={vp2_bins}")
+    if irl_vp2_bins != vp2_bins:
+        logger.log(f" IRL MODEL VP2_BINS={irl_vp2_bins} (different from Q-learning)")
     logger.log("="*70)
-    
-    # Save configuration to JSON
+
+    # Initialize data pipeline and infer reward type
+    logger.log("\nInitializing data pipeline...")
+    if reward_model_path is None:
+        reward_type = "manual"
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='manual', random_seed=42,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
+        )
+    elif 'gcl' in reward_model_path:
+        reward_type = "gcl"
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
+        )
+        pipeline.load_gcl_reward_model(reward_model_path)
+    elif 'iq_learn' in reward_model_path:
+        reward_type = "iq_learn"
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
+        )
+        pipeline.load_iq_learn_reward_model(reward_model_path)
+    elif 'maxent' in reward_model_path:
+        reward_type = "maxent"
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
+        )
+        pipeline.load_maxent_reward_model(reward_model_path)
+    elif 'semi_supervised_unet' in reward_model_path:
+        reward_type = "semi_supervised_unet"
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
+        )
+        # Use irl_vp2_bins for loading (IRL model's action space), not vp2_bins (Q-learning action space)
+        pipeline.load_semi_supervised_unet_reward_model(reward_model_path, vp1_bins=2, vp2_bins=irl_vp2_bins)
+        logger.log(f"  IRL model vp2_bins: {irl_vp2_bins}, Q-learning vp2_bins: {vp2_bins}")
+    elif 'unet' in reward_model_path:
+        reward_type = "unet"
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
+        )
+        # Use irl_vp2_bins for loading (IRL model's action space), not vp2_bins (Q-learning action space)
+        pipeline.load_unet_reward_model(reward_model_path, vp1_bins=2, vp2_bins=irl_vp2_bins)
+        logger.log(f"  IRL model vp2_bins: {irl_vp2_bins}, Q-learning vp2_bins: {vp2_bins}")
+    else:
+        raise ValueError(f"Cannot infer reward model type from path: {reward_model_path}")
+
+    # Use pipeline's get_reward_prefix for correct naming with lambda
+    experiment_prefix = pipeline.get_reward_prefix() if hasattr(pipeline, 'get_reward_prefix') else reward_type
+    experiment_prefix = f"lstm_{experiment_prefix}{suffix}"
+
+    logger.log(f"Reward type: {reward_type}")
+    logger.log(f"Experiment prefix: {experiment_prefix}")
+
+    # Save configuration to JSON (now that reward_type and experiment_prefix are defined)
     config = {
         'alpha': alpha,
         'vp2_bins': vp2_bins,
+        'irl_vp2_bins': irl_vp2_bins,
         'sequence_length': sequence_length,
         'burn_in_length': burn_in_length,
         'overlap': overlap,
@@ -170,18 +289,21 @@ def train_lstm_block_discrete_cql(
         'gamma': gamma,
         'grad_clip': grad_clip,
         'buffer_capacity': buffer_capacity,
-        'timestamp': timestamp
+        'timestamp': timestamp,
+        'reward_model_path': reward_model_path,
+        'reward_type': reward_type,
+        'experiment_prefix': experiment_prefix,
+        'suffix': suffix,
+        'reward_combine_lambda': reward_combine_lambda,
+        'combined_or_train_data_path': combined_or_train_data_path,
+        'eval_data_path': eval_data_path
     }
-    
+
     config_path = os.path.join(log_dir, f'lstm_block_discrete_cql_config_alpha{alpha_str}_bins{vp2_bins}_{timestamp}.json')
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=2)
     logger.log(f"Configuration saved to {config_path}")
-    
-    # Initialize data pipeline
-    logger.log("\nInitializing data pipeline...")
-    # Use 'dual' mode to get norepinephrine as separate column
-    pipeline = IntegratedDataPipelineV2(model_type='dual', random_seed=42)
+
     train_data, val_data, test_data = pipeline.prepare_data()
     
     # State dimension is without norepinephrine (since it's now an action)
@@ -419,15 +541,9 @@ def train_lstm_block_discrete_cql(
         # Save best model
         if val_metrics['mean_q_value'] > best_val_q:
             best_val_q = val_metrics['mean_q_value']
-            
-            # Use scientific notation for very small alphas to avoid filename collisions
-            if alpha == 0.0:
-                alpha_str = "0.0"
-            elif alpha < 0.0001:
-                alpha_str = f"{alpha:.1e}".replace('.', 'p').replace('-', 'm')
-            else:
-                alpha_str = f"{alpha:.4f}"
-            save_path = os.path.join(save_dir, f'lstm_block_discrete_cql_alpha{alpha_str}_bins{vp2_bins}_hdim{hidden_dim}_seql{sequence_length}_best.pt')
+
+            # Use consistent naming with experiment_prefix (includes lstm_ prefix and reward type)
+            save_path = os.path.join(save_dir, f'{experiment_prefix}_alpha{alpha:.4f}_bins{vp2_bins}_best.pt')
             torch.save({
                 'q1_state_dict': agent.q1.state_dict(),
                 'q2_state_dict': agent.q2.state_dict(),
@@ -459,15 +575,8 @@ def train_lstm_block_discrete_cql(
             logger.log(f"  Best Val Q: {best_val_q:.6f}")
             logger.log("")
     
-    # Save final model
-    # Use scientific notation for very small alphas to avoid filename collisions
-    if alpha == 0.0:
-        alpha_str = "0.0"
-    elif alpha < 0.0001:
-        alpha_str = f"{alpha:.1e}".replace('.', 'p').replace('-', 'm')
-    else:
-        alpha_str = f"{alpha:.4f}"
-    final_save_path = os.path.join(save_dir, f'lstm_bd_cql_vp12_alpha{alpha_str}_bins{vp2_bins}_hdim{hidden_dim}_seql{sequence_length}_final.pt')
+    # Save final model with consistent naming
+    final_save_path = os.path.join(save_dir, f'{experiment_prefix}_alpha{alpha:.4f}_bins{vp2_bins}_final.pt')
     torch.save({
         'q1_state_dict': agent.q1.state_dict(),
         'q2_state_dict': agent.q2.state_dict(),
@@ -498,44 +607,127 @@ def train_lstm_block_discrete_cql(
     logger.log("="*70)
     
     logger.close()
-    
-    return agent, train_buffer, val_buffer, training_history
+
+    return agent, train_buffer, val_buffer, training_history, experiment_prefix
 
 
 def main():
-    """Main training function."""
-    print("="*70)
-    print(" LSTM BLOCK DISCRETE CQL TRAINING WITH NOREPINEPHRINE AS ACTION")
-    print("="*70)
-    print("\nTraining LSTM-based Block Discrete CQL with Norepinephrine as discrete action")
-    print("Log files will be saved to logs/ directory")
-    print("Models will be saved to experiment/ directory")
-    
-    # Train with conservative penalty
-    agent, train_buffer, val_buffer, history = train_lstm_block_discrete_cql(
-        alpha=0.0,
-        vp2_bins=10,  # 5 discrete dosing levels for Norepinephrine (aligned with block discrete CQL)
-        sequence_length=5,
-        burn_in_length=2,
-        overlap=2,
-        hidden_dim=64,
-        lstm_hidden=64,
-        num_lstm_layers=2,
-        batch_size=32,
-        epochs=500,  # Full 100 epochs
-        learning_rate=1e-3,
-        tau=0.8,
-        gamma=0.95,
-        grad_clip=1.0,
-        buffer_capacity=50000,
-        log_every=1  # Log every epoch
+    """Main training function with argument parsing."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Train LSTM Block Discrete CQL with different configurations')
+    parser.add_argument('--vp2_bins', type=int, default=5,
+                       help='Number of bins for VP2 discretization (default: 5)')
+    parser.add_argument('--alpha', type=float, default=0.0,
+                       help='Alpha value for CQL penalty (default: 0.0)')
+    parser.add_argument('--epochs', type=int, default=100,
+                       help='Number of training epochs (default: 100)')
+    parser.add_argument('--sequence_length', type=int, default=20,
+                       help='Total sequence length for LSTM (default: 20)')
+    parser.add_argument('--burn_in_length', type=int, default=8,
+                       help='Burn-in length for LSTM hidden state (default: 8)')
+    parser.add_argument('--overlap', type=int, default=10,
+                       help='Overlap between consecutive sequences (default: 10)')
+    parser.add_argument('--hidden_dim', type=int, default=64,
+                       help='Hidden dimension for MLP layers (default: 64)')
+    parser.add_argument('--lstm_hidden', type=int, default=64,
+                       help='Hidden dimension for LSTM layers (default: 64)')
+    parser.add_argument('--num_lstm_layers', type=int, default=2,
+                       help='Number of LSTM layers (default: 2)')
+    parser.add_argument('--batch_size', type=int, default=32,
+                       help='Training batch size (default: 32)')
+    parser.add_argument('--learning_rate', type=float, default=1e-3,
+                       help='Learning rate (default: 1e-3)')
+    parser.add_argument('--tau', type=float, default=0.8,
+                       help='Soft update coefficient (default: 0.8)')
+    parser.add_argument('--gamma', type=float, default=0.95,
+                       help='Discount factor (default: 0.95)')
+    parser.add_argument('--grad_clip', type=float, default=1.0,
+                       help='Gradient clipping value (default: 1.0)')
+    parser.add_argument('--reward_model_path', type=str, default=None,
+                       help='Path to learned reward model (gcl/iq_learn/maxent/unet). None=manual reward')
+    parser.add_argument('--suffix', type=str, default='',
+                       help='Suffix to add to experiment prefix (e.g., "_test")')
+    parser.add_argument('--save_dir', type=str, default='experiment/ql',
+                       help='Directory to save models (default: experiment/ql)')
+    parser.add_argument('--log_dir', type=str, default='logs',
+                       help='Directory to save logs (default: logs)')
+    parser.add_argument('--reward_combine_lambda', type=float, default=None,
+                       help='Lambda for combining manual and IRL rewards: '
+                            '(1-lambda)*manual + lambda*IRL. None=pure IRL reward.')
+    parser.add_argument('--combined_or_train_data_path', type=str, default=None,
+                       help='Path to training dataset. If eval_data_path is also provided, '
+                            'all patients from this dataset are used for training. '
+                            'If eval_data_path is None, this dataset is split into train/val/test.')
+    parser.add_argument('--eval_data_path', type=str, default=None,
+                       help='Path to evaluation dataset (for val/test). If provided, enables '
+                            'dual-dataset mode where this dataset is split 50/50 into val/test.')
+    parser.add_argument('--irl_vp2_bins', type=int, default=None,
+                       help='Number of VP2 bins used to train the IRL model. If None, uses '
+                            'the same value as --vp2_bins. This allows loading an IRL model '
+                            'trained with different discretization than the Q-learning action space.')
+    args = parser.parse_args()
+
+    # Determine IRL model vp2_bins
+    irl_vp2_bins = args.irl_vp2_bins if args.irl_vp2_bins is not None else args.vp2_bins
+
+    print("="*70, flush=True)
+    print(" LSTM BLOCK DISCRETE CQL TRAINING", flush=True)
+    print("="*70, flush=True)
+    print("\nConfiguration:", flush=True)
+    print("  - VP1: Binary (0 or 1)", flush=True)
+    print(f"  - VP2: Discretized into {args.vp2_bins} bins (0 to 0.5 mcg/kg/min)", flush=True)
+    if args.irl_vp2_bins is not None and args.irl_vp2_bins != args.vp2_bins:
+        print(f"  - IRL model VP2 bins: {irl_vp2_bins} (different from Q-learning)", flush=True)
+    print(f"  - Alpha: {args.alpha}", flush=True)
+    print(f"  - Epochs: {args.epochs}", flush=True)
+    print(f"  - Sequence length: {args.sequence_length}", flush=True)
+    print(f"  - Burn-in length: {args.burn_in_length}", flush=True)
+    print(f"  - LSTM hidden: {args.lstm_hidden}", flush=True)
+    print(f"  - Reward model: {args.reward_model_path or 'manual'}", flush=True)
+    print(f"  - Reward combine lambda: {args.reward_combine_lambda}", flush=True)
+    print(f"  - Suffix: {args.suffix}", flush=True)
+    print(f"  - Total discrete actions: {2 * args.vp2_bins}", flush=True)
+    if args.eval_data_path:
+        print(f"  - Dataset mode: DUAL-DATASET", flush=True)
+        print(f"    Train data: {args.combined_or_train_data_path or 'default'}", flush=True)
+        print(f"    Eval data:  {args.eval_data_path}", flush=True)
+    else:
+        print(f"  - Dataset mode: SINGLE-DATASET", flush=True)
+        print(f"    Data path: {args.combined_or_train_data_path or 'default'}", flush=True)
+
+    # Train LSTM CQL
+    agent, train_buffer, val_buffer, history, exp_prefix = train_lstm_block_discrete_cql(
+        alpha=args.alpha,
+        vp2_bins=args.vp2_bins,
+        sequence_length=args.sequence_length,
+        burn_in_length=args.burn_in_length,
+        overlap=args.overlap,
+        hidden_dim=args.hidden_dim,
+        lstm_hidden=args.lstm_hidden,
+        num_lstm_layers=args.num_lstm_layers,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        tau=args.tau,
+        gamma=args.gamma,
+        grad_clip=args.grad_clip,
+        save_dir=args.save_dir,
+        log_dir=args.log_dir,
+        reward_model_path=args.reward_model_path,
+        suffix=args.suffix,
+        reward_combine_lambda=args.reward_combine_lambda,
+        combined_or_train_data_path=args.combined_or_train_data_path,
+        eval_data_path=args.eval_data_path,
+        irl_vp2_bins=irl_vp2_bins
     )
-    
-    print("\n" + "="*70)
-    print(" TRAINING COMPLETE")
-    print("="*70)
-    print("\nCheck logs/ directory for detailed training logs")
-    print("Check experiment/ directory for saved models")
+
+    print("\n" + "="*70, flush=True)
+    print(" TRAINING COMPLETE", flush=True)
+    print("="*70, flush=True)
+    print(f"\nModels saved in {args.save_dir}/ directory:", flush=True)
+    print(f"  {exp_prefix}_alpha{args.alpha:.4f}_bins{args.vp2_bins}_best.pt", flush=True)
+    print(f"Check {args.log_dir}/ directory for detailed training logs", flush=True)
 
 
 if __name__ == "__main__":

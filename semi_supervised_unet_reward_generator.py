@@ -64,6 +64,8 @@ class Config:
         for key, value in kwargs.items():
             if hasattr(self, key):
                 setattr(self, key, value)
+        # Recalculate action_size based on current vp1_bins and vp2_bins
+        self.action_size = self.vp1_bins * self.vp2_bins
 
 
 ## Mortality Diffuser: 3-layer ConvTranspose1d to expand scalar mortality to sequence
@@ -741,6 +743,12 @@ def main():
                        help='Enable semi-supervised mortality diffusion')
     parser.add_argument('--no_mortality_diffusion', action='store_true',
                        help='Disable semi-supervised mortality diffusion')
+    parser.add_argument('--combined_or_train_data_path', type=str, default=None,
+                       help='Path to training dataset. If eval_data_path is also provided, '
+                            'all patients from this dataset are used for training.')
+    parser.add_argument('--eval_data_path', type=str, default=None,
+                       help='Path to evaluation dataset (for val/test). If provided, enables '
+                            'dual-dataset mode where this dataset is split 50/50 into val/test.')
     args = parser.parse_args()
 
     # Determine mortality diffusion setting
@@ -777,10 +785,19 @@ def main():
         reward_source = 'manual'
 
     print(f"Initializing data pipeline with reward_source='{reward_source}'...")
+    if args.eval_data_path:
+        print(f"  Dataset mode: DUAL-DATASET")
+        print(f"    Train data: {args.combined_or_train_data_path or 'default'}")
+        print(f"    Eval data:  {args.eval_data_path}")
+    else:
+        print(f"  Dataset mode: SINGLE-DATASET")
+        print(f"    Data path: {args.combined_or_train_data_path or 'default'}")
     pipeline = IntegratedDataPipelineV3(
         model_type='dual',
         reward_source=reward_source,
-        random_seed=42
+        random_seed=42,
+        combined_or_train_data_path=args.combined_or_train_data_path,
+        eval_data_path=args.eval_data_path
     )
 
     # Train model

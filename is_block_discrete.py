@@ -27,6 +27,13 @@ parser.add_argument('--reward_type', type=str, default='manual', choices=['manua
                    help='Reward type: manual (clinician-defined) or irl (learned from IRL model)')
 parser.add_argument('--irl_model_path', type=str, default=None,
                    help='Path to IRL model for reward computation (required if reward_type=irl)')
+parser.add_argument('--combined_or_train_data_path', type=str, default=None,
+                   help='Path to training dataset. If eval_data_path is also provided, '
+                        'all patients from this dataset are used for training. '
+                        'If eval_data_path is None, this dataset is split into train/val/test.')
+parser.add_argument('--eval_data_path', type=str, default=None,
+                   help='Path to evaluation dataset (for val/test). If provided, enables '
+                        'dual-dataset mode where this dataset is split 50/50 into val/test.')
 args = parser.parse_args()
 
 # Validate arguments
@@ -84,7 +91,11 @@ if irl_model_path:
 # Initialize data pipeline based on reward type
 if reward_type == 'irl':
     # Use V3 pipeline with learned rewards
-    pipeline = IntegratedDataPipelineV3(model_type='dual', reward_source='learned', random_seed=42)
+    pipeline = IntegratedDataPipelineV3(
+        model_type='dual', reward_source='learned', random_seed=42,
+        combined_or_train_data_path=args.combined_or_train_data_path,
+        eval_data_path=args.eval_data_path
+    )
 
     # Detect IRL model type from path and load accordingly
     if 'iq_learn' in irl_model_path.lower():
@@ -104,8 +115,12 @@ if reward_type == 'irl':
 
     train_data, val_data, test_data = pipeline.prepare_data()
 else:
-    # Use V2 pipeline with manual rewards
-    pipeline = IntegratedDataPipelineV2(model_type='dual', random_seed=42)
+    # Use V3 pipeline with manual rewards (supports dual-dataset mode)
+    pipeline = IntegratedDataPipelineV3(
+        model_type='dual', reward_source='manual', random_seed=42,
+        combined_or_train_data_path=args.combined_or_train_data_path,
+        eval_data_path=args.eval_data_path
+    )
     train_data, val_data, test_data = pipeline.prepare_data()
 
 # Select evaluation data based on eval_set argument

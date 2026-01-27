@@ -16,7 +16,7 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
 # Import project modules
-from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
+from integrated_data_pipeline_v3 import IntegratedDataPipelineV3
 import data_config as config
 
 
@@ -39,7 +39,7 @@ class TrajectoryExtractor:
     Each trajectory contains 6 consecutive transitions for lookahead rewards.
     """
 
-    def __init__(self, pipeline: IntegratedDataPipelineV2, window_size: int = 6):
+    def __init__(self, pipeline: IntegratedDataPipelineV3, window_size: int = 6):
         """
         Args:
             pipeline: Initialized data pipeline with prepared data
@@ -665,7 +665,9 @@ def run_irl_recovery(
     window_size: int = 6,
     random_seed: int = 42,
     experiment_prefix: Optional[str] = None,
-    save_dir: str = 'experiment/irl'
+    save_dir: str = 'experiment/irl',
+    combined_or_train_data_path: str = None,
+    eval_data_path: str = None
 ) -> Tuple[MaxSLPIRLTrainer, Dict]:
     """
     Run the full IRL reward recovery pipeline.
@@ -695,7 +697,19 @@ def run_irl_recovery(
 
     # Stage 1: Load and extract trajectories
     print("\n[STAGE 1] Extracting trajectories...")
-    pipeline = IntegratedDataPipelineV2(model_type=model_type, random_seed=random_seed)
+    if eval_data_path:
+        print(f"  Dataset mode: DUAL-DATASET")
+        print(f"    Train data: {combined_or_train_data_path or 'default'}")
+        print(f"    Eval data:  {eval_data_path}")
+    else:
+        print(f"  Dataset mode: SINGLE-DATASET")
+        print(f"    Data path: {combined_or_train_data_path or 'default'}")
+    pipeline = IntegratedDataPipelineV3(
+        model_type=model_type,
+        random_seed=random_seed,
+        combined_or_train_data_path=combined_or_train_data_path,
+        eval_data_path=eval_data_path
+    )
     pipeline.prepare_data()
 
     extractor = TrajectoryExtractor(pipeline, window_size=window_size)
@@ -778,6 +792,12 @@ if __name__ == "__main__":
     parser.add_argument('--window_size', type=int, default=1)  # Default 1 for fair comparison
     parser.add_argument('--prefix', type=str, default='maxent')
     parser.add_argument('--save_dir', type=str, default='experiment/irl')
+    parser.add_argument('--combined_or_train_data_path', type=str, default=None,
+                       help='Path to training dataset. If eval_data_path is also provided, '
+                            'all patients from this dataset are used for training.')
+    parser.add_argument('--eval_data_path', type=str, default=None,
+                       help='Path to evaluation dataset (for val/test). If provided, enables '
+                            'dual-dataset mode where this dataset is split 50/50 into val/test.')
 
     args = parser.parse_args()
 
@@ -802,5 +822,7 @@ if __name__ == "__main__":
         window_size=args.window_size,
         random_seed=42,
         experiment_prefix=args.prefix,
-        save_dir=args.save_dir
+        save_dir=args.save_dir,
+        combined_or_train_data_path=args.combined_or_train_data_path,
+        eval_data_path=args.eval_data_path
     )
