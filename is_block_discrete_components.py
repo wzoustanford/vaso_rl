@@ -101,6 +101,15 @@ def parse_args():
                        help='Which data split to evaluate on (default: test)')
     parser.add_argument('--output_dir', type=str, default='irl_analysis',
                        help='Directory to save results (default: irl_analysis)')
+    parser.add_argument('--combined_or_train_data_path', type=str, default=None,
+                       help='Path to training dataset. If eval_data_path is also provided, '
+                            'all patients from this dataset are used for training. '
+                            'If eval_data_path is None, this dataset is split into train/val/test.')
+    parser.add_argument('--eval_data_path', type=str, default=None,
+                       help='Path to evaluation dataset (for val/test). If provided, enables '
+                            'dual-dataset mode where this dataset is split 50/50 into val/test.')
+    parser.add_argument('--use_lstm', action='store_true',
+                       help='Use LSTM Q-network instead of standard feedforward network')
     return parser.parse_args()
 
 
@@ -108,9 +117,18 @@ def parse_args():
 # Data Loading with Component-wise Rewards
 # ============================================================================
 
-def load_component_rewards(eval_set='test', random_seed=42):
+def load_component_rewards(eval_set='test', random_seed=42,
+                           combined_or_train_data_path=None, eval_data_path=None):
     """
     Load test/val data and compute component-wise rewards for each transition.
+
+    Args:
+        eval_set: Which data split to evaluate on ('test' or 'val')
+        random_seed: Random seed for reproducibility
+        combined_or_train_data_path: Path to training dataset. If eval_data_path is also
+            provided, all patients are used for training. Otherwise split into train/val/test.
+        eval_data_path: Path to evaluation dataset. If provided, enables dual-dataset mode
+            where this dataset is split 50/50 into val/test.
 
     Returns:
         components_by_transition: Dict[component_name -> np.array of shape (n_transitions,)]
@@ -123,19 +141,33 @@ def load_component_rewards(eval_set='test', random_seed=42):
     pipeline = IntegratedDataPipelineV3(
         model_type='dual',
         reward_source='manual',
-        random_seed=random_seed
+        random_seed=random_seed,
+        combined_or_train_data_path=combined_or_train_data_path,
+        eval_data_path=eval_data_path
     )
     train_data, val_data, test_data = pipeline.prepare_data()
 
     eval_data = test_data if eval_set == 'test' else val_data
 
     # Load raw data for component computation
-    loader = DataLoader(verbose=False, random_seed=random_seed)
+    # Use eval_data_path for component computation if in dual-dataset mode
+    data_path_for_components = eval_data_path if eval_data_path else combined_or_train_data_path
+    loader = DataLoader(verbose=False, random_seed=random_seed, data_path=data_path_for_components)
     splitter = DataSplitter(random_seed=random_seed)
 
     full_data = loader.load_data()
     patient_ids = loader.get_patient_ids()
-    train_patients, val_patients, test_patients = splitter.split_patients(patient_ids)
+
+    # In dual-dataset mode, eval patients come from eval_data_path (split 50/50)
+    if eval_data_path:
+        # Split eval dataset 50/50 into val/test
+        n_eval_patients = len(patient_ids)
+        n_val = n_eval_patients // 2
+        val_patients = patient_ids[:n_val]
+        test_patients = patient_ids[n_val:]
+        train_patients = []  # Not used for component computation
+    else:
+        train_patients, val_patients, test_patients = splitter.split_patients(patient_ids)
 
     loader.encode_categorical_features()
     state_features = config.DUAL_STATE_FEATURES
@@ -197,12 +229,31 @@ def load_component_rewards(eval_set='test', random_seed=42):
 # Model Loading and Action Selection
 # ============================================================================
 
-def load_q_networks(model_path, state_dim, n_bins, device):
-    """Load trained Q-networks from checkpoint."""
-    from run_block_discrete_cql_allalphas import DualBlockDiscreteQNetwork
+def load_q_networks(model_path, state_dim, n_bins, device, use_lstm=False):
+    """Load trained Q-networks from checkpoint.
 
-    q1_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
-    q2_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
+    Args:
+        model_path: Path to model checkpoint
+        state_dim: State dimension
+        n_bins: Number of VP2 bins
+        device: Torch device
+        use_lstm: Whether to load LSTM Q-networks (default: False)
+
+    Returns:
+        q1_network, q2_network: Loaded Q-networks
+    """
+    n_actions = 2 * n_bins  # VP1 (2) x VP2 (n_bins)
+
+    if use_lstm:
+        from lstm_block_discrete_cql_network import LSTMDiscreteQNetwork
+
+        q1_network = LSTMDiscreteQNetwork(state_dim=state_dim, num_actions=n_actions).to(device)
+        q2_network = LSTMDiscreteQNetwork(state_dim=state_dim, num_actions=n_actions).to(device)
+    else:
+        from run_block_discrete_cql_allalphas import DualBlockDiscreteQNetwork
+
+        q1_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
+        q2_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
 
     checkpoint = torch.load(model_path, map_location=device)
     q1_network.load_state_dict(checkpoint['q1_state_dict'])
@@ -304,11 +355,11 @@ def compute_is_weights(eval_states, eval_clinician_actions, clf_model, clf_clini
     is_weight = eval_prob_model / (eval_prob_clinician + eps)
 
     # Clip weights
-    isw_ci_lower = np.percentile(is_weight, 2.5)
-    isw_ci_upper = np.percentile(is_weight, 97.5)
+    isw_ci_lower = np.percentile(is_weight, 0.5) #2.5
+    isw_ci_upper = np.percentile(is_weight, 99.5) #97.5
     is_weight = np.clip(is_weight, a_min=isw_ci_lower, a_max=isw_ci_upper)
 
-    return is_weight
+    return is_weight, isw_ci_lower, isw_ci_upper
 
 
 # ============================================================================
@@ -324,7 +375,7 @@ def compute_wis_transition_level(is_weight, rewards):
     return wis, clinician_mean
 
 
-def compute_wis_trajectory_level(is_weight, rewards, patient_ids, n_bootstrap=1000):
+def compute_wis_trajectory_level(is_weight, rewards, patient_ids, isw_ci_diff_lower, isw_ci_diff_upper, n_bootstrap=1000):
     """
     Compute WIS at trajectory level with bootstrapped 95% CI.
 
@@ -344,6 +395,10 @@ def compute_wis_trajectory_level(is_weight, rewards, patient_ids, n_bootstrap=10
         mask = patient_ids == patient_id
         patient_weights = is_weight[mask]
         patient_rewards = rewards[mask]
+        weights_per_traj.append(patient_weights.mean())
+
+        patient_weights = np.cumprod(patient_weights)
+        patient_weights = np.clip(patient_weights, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
 
         # WIS per trajectory
         if patient_weights.sum() > 0:
@@ -351,7 +406,7 @@ def compute_wis_trajectory_level(is_weight, rewards, patient_ids, n_bootstrap=10
         else:
             est_total = 0.0
 
-        weights_per_traj.append(patient_weights.mean())
+        
         total_rewards_per_traj.append(patient_rewards.sum())
         weighted_rewards_per_traj.append(est_total)
 
@@ -392,6 +447,75 @@ def compute_wis_trajectory_level(is_weight, rewards, patient_ids, n_bootstrap=10
     return wis, clinician_mean, ci_lower, ci_upper
 
 
+def compute_wis_trajectory_level_sparse(is_weight, rewards, patient_ids, n_bootstrap=1000):
+    """
+    Compute WIS at trajectory level for SPARSE rewards (like mortality).
+
+    Unlike regular trajectory WIS, this does NOT apply per-transition weights
+    within each trajectory. Instead:
+    - Sum the sparse reward per trajectory (raw, unweighted)
+    - Weight each trajectory's total by the trajectory-level IS weight
+
+    This is appropriate for sparse terminal rewards like mortality where
+    the reward only appears once per trajectory.
+
+    Returns:
+        wis: WIS estimate
+        clinician_mean: Mean clinician reward per trajectory
+        ci_lower: 95% CI lower bound for difference
+        ci_upper: 95% CI upper bound for difference
+    """
+    unique_patients = np.unique(patient_ids)
+
+    weights_per_traj = []
+    total_rewards_per_traj = []
+
+    for patient_id in unique_patients:
+        mask = patient_ids == patient_id
+        patient_weights = is_weight[mask]
+        patient_rewards = rewards[mask]
+
+        # Trajectory weight = mean of transition weights (same as before)
+        weights_per_traj.append(patient_weights.mean())
+        # Raw sum of sparse reward (no per-transition weighting)
+        total_rewards_per_traj.append(patient_rewards.sum())
+
+    weights_per_traj = np.array(weights_per_traj)
+    total_rewards_per_traj = np.array(total_rewards_per_traj)
+
+    # WIS: weight each trajectory's total reward by trajectory weight
+    if weights_per_traj.sum() > 0:
+        wis = (weights_per_traj * total_rewards_per_traj).sum() / weights_per_traj.sum()
+    else:
+        wis = 0.0
+
+    clinician_mean = total_rewards_per_traj.mean()
+
+    # Bootstrap for 95% CI
+    np.random.seed(42)
+    bootstrap_diffs = []
+
+    for _ in range(n_bootstrap):
+        idx = np.random.choice(len(total_rewards_per_traj), size=len(total_rewards_per_traj), replace=True)
+
+        boot_weights = weights_per_traj[idx]
+        boot_rewards = total_rewards_per_traj[idx]
+
+        if boot_weights.sum() > 0:
+            boot_wis = (boot_weights * boot_rewards).sum() / boot_weights.sum()
+        else:
+            boot_wis = 0.0
+
+        boot_clinician = boot_rewards.mean()
+        bootstrap_diffs.append(boot_wis - boot_clinician)
+
+    bootstrap_diffs = np.array(bootstrap_diffs)
+    ci_lower = np.percentile(bootstrap_diffs, 2.5)
+    ci_upper = np.percentile(bootstrap_diffs, 97.5)
+
+    return wis, clinician_mean, ci_lower, ci_upper
+
+
 # ============================================================================
 # Table Generation
 # ============================================================================
@@ -424,9 +548,13 @@ def generate_component_wis_table(results, level='transition'):
         else:
             clinician = r.get('clinician', 0)
             wis = r.get('wis', 0)
-            diff = wis - clinician
 
-            row = f"{display_name:<24} | {clinician:>12.4f} {wis:>12.4f} {diff:>12.4f}"
+            # Handle NaN for sparse rewards (e.g., mortality at transition level)
+            if np.isnan(wis) if isinstance(wis, float) else False:
+                row = f"{display_name:<24} | {clinician:>12.4f} {'N/A':>12} {'N/A':>12}"
+            else:
+                diff = wis - clinician
+                row = f"{display_name:<24} | {clinician:>12.4f} {wis:>12.4f} {diff:>12.4f}"
 
             if level == 'trajectory' and 'ci_lower' in r:
                 ci_str = f"[{r['ci_lower']:.4f}, {r['ci_upper']:.4f}]"
@@ -463,11 +591,20 @@ def generate_component_wis_latex(results_trans, results_traj, output_path):
         if 'error' in rt:
             trans_vals = ['--', '--', '--']
         else:
-            trans_vals = [
-                f"{rt.get('clinician', 0):.3f}",
-                f"{rt.get('wis', 0):.3f}",
-                f"{rt.get('wis', 0) - rt.get('clinician', 0):.3f}",
-            ]
+            wis_trans = rt.get('wis', 0)
+            # Handle NaN for sparse rewards (e.g., mortality)
+            if np.isnan(wis_trans) if isinstance(wis_trans, float) else False:
+                trans_vals = [
+                    f"{rt.get('clinician', 0):.3f}",
+                    'N/A',
+                    'N/A',
+                ]
+            else:
+                trans_vals = [
+                    f"{rt.get('clinician', 0):.3f}",
+                    f"{wis_trans:.3f}",
+                    f"{wis_trans - rt.get('clinician', 0):.3f}",
+                ]
 
         if 'error' in rj:
             traj_vals = ['--', '--', '--', '--']
@@ -515,6 +652,13 @@ def run_component_wis_analysis(args):
     print(f"Model: {args.model_path}")
     print(f"VP2 bins: {args.vp2_bins}")
     print(f"Eval set: {args.eval_set}")
+    if args.eval_data_path:
+        print(f"Dataset mode: DUAL-DATASET")
+        print(f"  Train data: {args.combined_or_train_data_path or 'default'}")
+        print(f"  Eval data:  {args.eval_data_path}")
+    else:
+        print(f"Dataset mode: SINGLE-DATASET")
+        print(f"  Data path: {args.combined_or_train_data_path or 'default'}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
@@ -527,7 +671,9 @@ def run_component_wis_analysis(args):
     # =========================================================================
     components_by_transition, eval_data, train_data = load_component_rewards(
         eval_set=args.eval_set,
-        random_seed=RANDOM_SEED
+        random_seed=RANDOM_SEED,
+        combined_or_train_data_path=args.combined_or_train_data_path,
+        eval_data_path=args.eval_data_path
     )
 
     # =========================================================================
@@ -559,7 +705,7 @@ def run_component_wis_analysis(args):
         train_data['states'], train_model_actions, train_clinician_actions, n_actions
     )
 
-    is_weight = compute_is_weights(
+    is_weight, isw_ci_lower, isw_ci_upper = compute_is_weights(
         eval_data['states'], eval_clinician_actions, clf_model, clf_clinician, n_actions
     )
 
@@ -588,7 +734,60 @@ def run_component_wis_analysis(args):
         comp_rewards_aligned = comp_rewards[:min_len]
         is_weight_aligned = is_weight[:min_len]
         patient_ids_aligned = eval_patient_ids[:min_len]
+        
+        """
+        # Special handling for mortality (sparse terminal reward)
+        if comp == 'mortality':
+            # Transition-level: Not applicable for sparse rewards
+            # Report raw clinician mean only (no WIS)
+            results_transition[comp] = {
+                'wis': np.nan,  # Not applicable
+                'clinician': comp_rewards_aligned.mean(),
+                'note': 'Transition-level WIS not applicable for sparse terminal reward'
+            }
 
+            # Trajectory-level: Use sparse WIS (no per-transition weighting)
+            comp_rewards_offset = (comp_rewards_aligned + 10) / 5.0
+            wis_traj, clin_traj, ci_lower, ci_upper = compute_wis_trajectory_level_sparse(
+                is_weight_aligned, comp_rewards_offset, patient_ids_aligned
+            )
+            results_trajectory[comp] = {
+                'wis': wis_traj,
+                'clinician': clin_traj,
+                'ci_lower': ci_lower,
+                'ci_upper': ci_upper,
+            }
+
+            print(f"  Transition: N/A (sparse reward)")
+            print(f"  Trajectory (sparse): Clinician={clin_traj:.4f}, WIS={wis_traj:.4f}, Diff={wis_traj-clin_traj:.4f}")
+        else:
+        """
+        
+        if comp == 'mortality':
+            # Per-transition credit assignment for mortality
+            # Assign K/L to each transition where K = +10 (survived) or -10 (died)
+            comp_rewards_credit = np.zeros_like(comp_rewards_aligned)
+
+            unique_patients = np.unique(patient_ids_aligned)
+            for pid in unique_patients:
+                mask = patient_ids_aligned == pid
+                traj_len = mask.sum()  # L = trajectory length
+
+                # Determine mortality outcome from raw component values
+                # Raw mortality component: -10 at terminal state if died, 0 otherwise
+                # So sum < 0 means patient died
+                patient_mortality_sum = comp_rewards_aligned[mask].sum()
+                if patient_mortality_sum < 0:  # patient died
+                    K = -10
+                else:  # patient survived
+                    K = 10
+
+                # Assign K/L to each transition
+                comp_rewards_credit[mask] = K / traj_len
+
+            comp_rewards_aligned = comp_rewards_credit
+
+        # Standard handling for dense rewards
         # Transition-level WIS
         wis_trans, clin_trans = compute_wis_transition_level(is_weight_aligned, comp_rewards_aligned)
         results_transition[comp] = {
@@ -598,7 +797,7 @@ def run_component_wis_analysis(args):
 
         # Trajectory-level WIS
         wis_traj, clin_traj, ci_lower, ci_upper = compute_wis_trajectory_level(
-            is_weight_aligned, comp_rewards_aligned, patient_ids_aligned
+            is_weight_aligned, comp_rewards_aligned, patient_ids_aligned, isw_ci_lower, isw_ci_upper,
         )
         results_trajectory[comp] = {
             'wis': wis_traj,
@@ -635,6 +834,8 @@ def run_component_wis_analysis(args):
             'model_path': args.model_path,
             'vp2_bins': args.vp2_bins,
             'eval_set': args.eval_set,
+            'combined_or_train_data_path': args.combined_or_train_data_path,
+            'eval_data_path': args.eval_data_path,
         },
         'transition_level': results_transition,
         'trajectory_level': results_trajectory,
@@ -688,8 +889,13 @@ def generate_all_models_component_table(all_results, level='trajectory'):
                 if 'error' in result or not result:
                     values.append(f"{'N/A':>14}")
                 else:
-                    diff = result.get('wis', 0) - result.get('clinician', 0)
-                    values.append(f"{diff:>14.4f}")
+                    wis = result.get('wis', 0)
+                    # Handle NaN for sparse rewards (e.g., mortality at transition level)
+                    if np.isnan(wis) if isinstance(wis, float) else False:
+                        values.append(f"{'N/A':>14}")
+                    else:
+                        diff = wis - result.get('clinician', 0)
+                        values.append(f"{diff:>14.4f}")
 
         lines.append(f"{comp_display:<24} | {'  '.join(values)}")
 
@@ -849,7 +1055,7 @@ def evaluate_single_model(model_path, model_name, components_by_transition, eval
     )
 
     # Compute IS weights
-    is_weight = compute_is_weights(
+    is_weight, isw_ci_lower, isw_ci_upper = compute_is_weights(
         eval_data['states'], eval_clinician_actions, clf_model, clf_clinician, n_actions
     )
 
@@ -870,6 +1076,32 @@ def evaluate_single_model(model_path, model_name, components_by_transition, eval
         is_weight_aligned = is_weight[:min_len]
         patient_ids_aligned = eval_patient_ids[:min_len]
 
+        # Transform mortality rewards for per-transition credit assignment
+        if comp == 'mortality':
+            # Per-transition credit assignment for mortality
+            # Assign K/L to each transition where K = +10 (survived) or -10 (died)
+            comp_rewards_credit = np.zeros_like(comp_rewards_aligned)
+
+            unique_patients = np.unique(patient_ids_aligned)
+            for pid in unique_patients:
+                mask = patient_ids_aligned == pid
+                traj_len = mask.sum()  # L = trajectory length
+
+                # Determine mortality outcome from raw component values
+                # Raw mortality component: -10 at terminal state if died, 0 otherwise
+                # So sum < 0 means patient died
+                patient_mortality_sum = comp_rewards_aligned[mask].sum()
+                if patient_mortality_sum < 0:  # patient died
+                    K = -10
+                else:  # patient survived
+                    K = +10
+
+                # Assign K/L to each transition
+                comp_rewards_credit[mask] = K / traj_len
+
+            comp_rewards_aligned = comp_rewards_credit
+
+        # Standard handling for all components
         # Transition-level WIS
         wis_trans, clin_trans = compute_wis_transition_level(is_weight_aligned, comp_rewards_aligned)
         results_transition[comp] = {
@@ -879,7 +1111,7 @@ def evaluate_single_model(model_path, model_name, components_by_transition, eval
 
         # Trajectory-level WIS
         wis_traj, clin_traj, ci_lower, ci_upper = compute_wis_trajectory_level(
-            is_weight_aligned, comp_rewards_aligned, patient_ids_aligned
+            is_weight_aligned, comp_rewards_aligned, patient_ids_aligned, isw_ci_lower, isw_ci_upper, 
         )
         results_trajectory[comp] = {
             'wis': wis_traj,
@@ -903,12 +1135,20 @@ def evaluate_single_model(model_path, model_name, components_by_transition, eval
 # Run All Models Analysis
 # ============================================================================
 
-def run_all_models_analysis(eval_set='test', vp2_bins=5, output_dir='irl_analysis'):
+def run_all_models_analysis(eval_set='test', vp2_bins=5, output_dir='irl_analysis',
+                            combined_or_train_data_path=None, eval_data_path=None):
     """
     Run component-wise WIS analysis for all IRL models.
 
     Evaluates each Q-learning model (trained with different IRL rewards)
     and generates combined tables.
+
+    Args:
+        eval_set: Which data split to evaluate on ('test' or 'val')
+        vp2_bins: Number of bins for VP2 discretization
+        output_dir: Directory to save results
+        combined_or_train_data_path: Path to training dataset
+        eval_data_path: Path to evaluation dataset (enables dual-dataset mode)
     """
     import pickle
 
@@ -918,6 +1158,13 @@ def run_all_models_analysis(eval_set='test', vp2_bins=5, output_dir='irl_analysi
     print("=" * 80)
     print(f"VP2 bins: {vp2_bins}")
     print(f"Eval set: {eval_set}")
+    if eval_data_path:
+        print(f"Dataset mode: DUAL-DATASET")
+        print(f"  Train data: {combined_or_train_data_path or 'default'}")
+        print(f"  Eval data:  {eval_data_path}")
+    else:
+        print(f"Dataset mode: SINGLE-DATASET")
+        print(f"  Data path: {combined_or_train_data_path or 'default'}")
     print(f"Models to evaluate: {len(MODEL_ORDER)}")
     for m in MODEL_ORDER:
         print(f"  - {MODEL_DISPLAY_NAMES[m]}: {QL_MODEL_PATHS.get(m, 'N/A')}")
@@ -934,7 +1181,9 @@ def run_all_models_analysis(eval_set='test', vp2_bins=5, output_dir='irl_analysi
 
     components_by_transition, eval_data, train_data = load_component_rewards(
         eval_set=eval_set,
-        random_seed=RANDOM_SEED
+        random_seed=RANDOM_SEED,
+        combined_or_train_data_path=combined_or_train_data_path,
+        eval_data_path=eval_data_path
     )
 
     # =========================================================================
@@ -1002,6 +1251,8 @@ def run_all_models_analysis(eval_set='test', vp2_bins=5, output_dir='irl_analysi
             'eval_set': eval_set,
             'model_paths': QL_MODEL_PATHS,
             'irl_model_paths': IRL_MODEL_PATHS,
+            'combined_or_train_data_path': combined_or_train_data_path,
+            'eval_data_path': eval_data_path,
         },
         'all_results': all_results,
     }
@@ -1027,6 +1278,9 @@ if __name__ == "__main__":
         eval_set = 'test'
         vp2_bins = DEFAULT_VP2_BINS
         output_dir = 'irl_analysis'
+        combined_or_train_data_path = None
+        eval_data_path = None
+        use_lstm = False
 
         # Parse optional args for all-models mode
         for i, arg in enumerate(sys.argv):
@@ -1036,11 +1290,20 @@ if __name__ == "__main__":
                 vp2_bins = int(sys.argv[i + 1])
             elif arg == '--output_dir' and i + 1 < len(sys.argv):
                 output_dir = sys.argv[i + 1]
+            elif arg == '--combined_or_train_data_path' and i + 1 < len(sys.argv):
+                combined_or_train_data_path = sys.argv[i + 1]
+            elif arg == '--eval_data_path' and i + 1 < len(sys.argv):
+                eval_data_path = sys.argv[i + 1]
+            elif arg == '--use_lstm':
+                use_lstm = True
 
         run_all_models_analysis(
             eval_set=eval_set,
             vp2_bins=vp2_bins,
-            output_dir=output_dir
+            output_dir=output_dir,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path,
+            use_lstm=use_lstm
         )
     else:
         # Single model mode (original behavior)
