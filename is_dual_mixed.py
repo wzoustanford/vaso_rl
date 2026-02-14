@@ -35,7 +35,8 @@ dual_agent = DualMixedCQL(
 )
 
 # Load the trained model checkpoint
-model_path = 'experiment/epoch500_new_trained_oviss_reward_models/dual_rev_cql_alpha0.0000_best.pt'
+model_path = 'experiment/dual_rev_cql_alpha0.0000_best.pt'
+#'experiment/epoch500_new_trained_oviss_reward_models/dual_rev_cql_alpha0.0000_best.pt'
 
 checkpoint = torch.load(model_path, map_location=device)
 dual_agent.q1.load_state_dict(checkpoint['q1_state_dict'])
@@ -369,8 +370,8 @@ is_weight_numerator = test_prob_vp1_model * test_prob_vp2_model
 is_weight_denominator = test_prob_vp1_clinician * test_prob_vp2_clinician
 is_weight = is_weight_numerator / (is_weight_denominator + eps)
 
-isw_ci_diff_lower = np.percentile(is_weight, 2.5)
-isw_ci_diff_upper = np.percentile(is_weight, 97.5)
+isw_ci_diff_lower = np.percentile(is_weight, 0.5) #2.5
+isw_ci_diff_upper = np.percentile(is_weight, 99.5) #97.5
 
 #is_weight = np.clip(is_weight, a_min = CLIP_MIN, a_max = CLIP_MAX)
 is_weight = np.clip(is_weight, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
@@ -550,9 +551,15 @@ for patient_id in unique_patients:
     # Get weights and rewards for this trajectory
     patient_weights = is_weight[patient_mask]
     patient_rewards = test_rewards[patient_mask]
+
+    weights_per_trajectory_list.append(patient_weights.mean())
+
+    patient_weights = np.cumprod(patient_weights)
+    patient_weights = np.clip(patient_weights, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
+
     est_total_reward_per_traj = (patient_weights *  patient_rewards).sum() / patient_weights.sum() * len(patient_weights)
     
-    weights_per_trajectory_list.append(patient_weights.mean())
+    #weights_per_trajectory_list.append(patient_weights.mean())
     total_rewards_per_trajectory_list.append(patient_rewards.sum())
     weighted_rewards_per_trajectory_list.append(est_total_reward_per_traj)
     

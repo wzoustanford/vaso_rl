@@ -34,6 +34,8 @@ parser.add_argument('--combined_or_train_data_path', type=str, default=None,
 parser.add_argument('--eval_data_path', type=str, default=None,
                    help='Path to evaluation dataset (for val/test). If provided, enables '
                         'dual-dataset mode where this dataset is split 50/50 into val/test.')
+parser.add_argument('--use_lstm', action='store_true',
+                   help='Use LSTM Q-network instead of standard feedforward network')
 args = parser.parse_args()
 
 # Validate arguments
@@ -45,6 +47,7 @@ model_path = args.model_path
 eval_set = args.eval_set
 reward_type = args.reward_type
 irl_model_path = args.irl_model_path
+use_lstm = args.use_lstm
 
 # Define constants
 STATE_DIM = 17  # 17 state features for dual model
@@ -54,28 +57,51 @@ STATE_DIM = 17  # 17 state features for dual model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-# Import the network class from the training script
-from run_block_discrete_cql_allalphas import DualBlockDiscreteQNetwork
-
 # Model parameters
 n_actions = 2 * n_bins  # VP1 (2 options: 0,1) x VP2 (5 bins) = 10 total actions
 state_dim = STATE_DIM  # 17 features
 
-# Initialize Q-networks (we use both Q1 and Q2, then take min)
-q1_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
-q2_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
+# Initialize and load Q-networks based on model type
+if use_lstm:
+    # Import LSTM network class
+    from lstm_block_discrete_cql_network import LSTMDiscreteQNetwork
 
-# Load the trained model checkpoint
-checkpoint = torch.load(model_path, map_location=device)
-q1_network.load_state_dict(checkpoint['q1_state_dict'])
-q2_network.load_state_dict(checkpoint['q2_state_dict'])
-q1_network.eval()
-q2_network.eval()
+    # LSTM uses num_actions directly (not 2*n_bins structure)
+    q1_network = LSTMDiscreteQNetwork(state_dim=state_dim, num_actions=n_actions).to(device)
+    q2_network = LSTMDiscreteQNetwork(state_dim=state_dim, num_actions=n_actions).to(device)
 
-print(f"Loaded model from: {model_path}")
-print(f"State dimension: {state_dim}")
-print(f"Number of actions: {n_actions} (VP1: 2 binary × VP2: {n_bins} bins)")
-print("Using min(Q1, Q2) for action selection (double Q-learning)") 
+    # Load the trained model checkpoint
+    checkpoint = torch.load(model_path, map_location=device)
+    q1_network.load_state_dict(checkpoint['q1_state_dict'])
+    q2_network.load_state_dict(checkpoint['q2_state_dict'])
+    q1_network.eval()
+    q2_network.eval()
+
+    print(f"Loaded LSTM model from: {model_path}")
+    print(f"State dimension: {state_dim}")
+    print(f"Number of actions: {n_actions} (VP1: 2 binary × VP2: {n_bins} bins)")
+    print("Using min(Q1, Q2) for action selection (double Q-learning)")
+    print("Model type: LSTM Q-Network")
+else:
+    # Import the network class from the training script
+    from run_block_discrete_cql_allalphas import DualBlockDiscreteQNetwork
+
+    # Initialize Q-networks (we use both Q1 and Q2, then take min)
+    q1_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
+    q2_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
+
+    # Load the trained model checkpoint
+    checkpoint = torch.load(model_path, map_location=device)
+    q1_network.load_state_dict(checkpoint['q1_state_dict'])
+    q2_network.load_state_dict(checkpoint['q2_state_dict'])
+    q1_network.eval()
+    q2_network.eval()
+
+    print(f"Loaded model from: {model_path}")
+    print(f"State dimension: {state_dim}")
+    print(f"Number of actions: {n_actions} (VP1: 2 binary × VP2: {n_bins} bins)")
+    print("Using min(Q1, Q2) for action selection (double Q-learning)")
+    print("Model type: Feedforward Q-Network") 
 
 ###
 # prepare and load the data with random seed 42
@@ -170,7 +196,7 @@ print("="*70)
 vp2_bin_edges = np.linspace(0, 0.5, n_bins + 1)
 print(f"VP2 bin edges: {vp2_bin_edges}")
 
-# Helper function to select actions and return DISCRETE indices (0-9)
+# Helper function to select actions and return DISCRETE indices (0-9) - Feedforward version
 def select_action_batch_discrete(states, q1_net, q2_net, vp2_bins, device):
     """
     Select best actions for a batch of states using min(Q1, Q2)
@@ -203,6 +229,43 @@ def select_action_batch_discrete(states, q1_net, q2_net, vp2_bins, device):
 
         return best_action_indices
 
+
+# Helper function to select actions using LSTM networks
+def select_action_batch_discrete_lstm(states, q1_net, q2_net, device):
+    """
+    Select best actions for a batch of states using LSTM Q-networks with min(Q1, Q2).
+    LSTM networks output Q-values for all actions at once, no need to loop.
+
+    Note: For WIS evaluation, we use fresh hidden states for each state
+    (stateless inference). This is simpler and appropriate since we're
+    evaluating per-transition, not per-trajectory.
+
+    Returns: numpy array of discrete action indices [0-9]
+    """
+    with torch.no_grad():
+        if states.ndim == 1:
+            states = states.reshape(1, -1)
+
+        batch_size = states.shape[0]
+        state_tensor = torch.FloatTensor(states).to(device)
+
+        # Initialize fresh hidden states
+        hidden1 = q1_net.init_hidden(batch_size, device)
+        hidden2 = q2_net.init_hidden(batch_size, device)
+
+        # Forward pass - LSTM returns Q-values for all actions at once
+        # forward_single_step: state [batch_size, state_dim] -> q_values [batch_size, num_actions]
+        q1_values, _ = q1_net.forward_single_step(state_tensor, hidden1)
+        q2_values, _ = q2_net.forward_single_step(state_tensor, hidden2)
+
+        # Take minimum of Q1 and Q2
+        q_values = torch.min(q1_values, q2_values)
+
+        # Get best action indices
+        best_action_indices = q_values.argmax(dim=1).cpu().numpy()
+
+        return best_action_indices
+
 # Helper function to convert continuous actions to discrete indices
 def continuous_to_discrete_action(actions, vp2_edges, vp2_bins):
     """
@@ -222,10 +285,16 @@ def continuous_to_discrete_action(actions, vp2_edges, vp2_bins):
 
 # Get model actions as discrete indices (0-9)
 print("Computing model actions (discrete) for training data...")
-train_model_actions_discrete = select_action_batch_discrete(train_data['states'], q1_network, q2_network, n_bins, device)
+if use_lstm:
+    train_model_actions_discrete = select_action_batch_discrete_lstm(train_data['states'], q1_network, q2_network, device)
+else:
+    train_model_actions_discrete = select_action_batch_discrete(train_data['states'], q1_network, q2_network, n_bins, device)
 
 print(f"Computing model actions (discrete) for {eval_set_name.lower()} data...")
-eval_model_actions_discrete = select_action_batch_discrete(eval_data['states'], q1_network, q2_network, n_bins, device)
+if use_lstm:
+    eval_model_actions_discrete = select_action_batch_discrete_lstm(eval_data['states'], q1_network, q2_network, device)
+else:
+    eval_model_actions_discrete = select_action_batch_discrete(eval_data['states'], q1_network, q2_network, n_bins, device)
 
 # Convert clinician continuous actions to discrete indices (0-9)
 train_clinician_actions_discrete = continuous_to_discrete_action(train_data['actions'], vp2_bin_edges, n_bins)
@@ -348,11 +417,13 @@ eps = 1e-10
 # IS_weight = π_model(a_clinician|s) / π_clinician(a_clinician|s)
 is_weight = eval_prob_model / (eval_prob_clinician + eps)
 
-isw_ci_diff_lower = np.percentile(is_weight, 2.5)
-isw_ci_diff_upper = np.percentile(is_weight, 97.5)
+isw_ci_diff_lower = np.percentile(is_weight, 0.5) #2.5
+isw_ci_diff_upper = np.percentile(is_weight, 99.5) #97.5
 
 #is_weight = np.clip(is_weight, a_min = CLIP_MIN, a_max = CLIP_MAX)
 is_weight = np.clip(is_weight, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
+
+#is_weight = np.cumprod(is_weight)
 
 print(f"\nIS weight statistics:")
 print(f"  Mean: {is_weight.mean():.4f}, Std: {is_weight.std():.4f}, Min: {is_weight.min():.4f}, Max: {is_weight.max():.4f}")
@@ -529,9 +600,14 @@ for patient_id in unique_patients:
     # Get weights and rewards for this trajectory
     patient_weights = is_weight[patient_mask]
     patient_rewards = eval_rewards[patient_mask]
+    weights_per_trajectory_list.append(patient_weights.mean())
+
+    patient_weights = np.cumprod(patient_weights)
+    patient_weights = np.clip(patient_weights, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
+    
+    # np.clip(is_weight, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
     est_total_reward_per_traj = (patient_weights *  patient_rewards).sum() / patient_weights.sum() * len(patient_weights)
 
-    weights_per_trajectory_list.append(patient_weights.mean())
     total_rewards_per_trajectory_list.append(patient_rewards.sum())
     weighted_rewards_per_trajectory_list.append(est_total_reward_per_traj)
     
@@ -549,6 +625,8 @@ total_rewards_per_trajectory_list = np.array(total_rewards_per_trajectory_list)
 weighted_rewards_per_trajectory_list = np.array(weighted_rewards_per_trajectory_list)
 
 wis_trajectory_level = (weights_per_trajectory_list * weighted_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum() 
+
+#wis_trajectory_level = weighted_rewards_per_trajectory_list.mean()
 
 # Also compute raw clinician per-trajectory for comparison
 clinician_per_trajectory_mean = total_rewards_per_trajectory_list.mean()

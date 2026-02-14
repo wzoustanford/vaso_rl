@@ -36,7 +36,8 @@ binary_agent = BinaryCQL(
 )
 
 # Load the trained model checkpoint
-model_path = 'experiment/binary_vp1_only/binary_cql_unified_alpha00_final.pt'
+model_path = 'experiment/binary_cql_unified_alpha00_best.pt'
+#'experiment/binary_vp1_only/binary_cql_unified_alpha00_final.pt'
 
 checkpoint = torch.load(model_path, map_location=device)
 binary_agent.q1.load_state_dict(checkpoint['q1_state_dict'])
@@ -219,8 +220,8 @@ eps = 1e-10
 is_weight = test_prob_model / (test_prob_clinician + eps)
 
 # simple clipping: keep 95% of the data and clip the out-lines 
-isw_ci_diff_lower = np.percentile(is_weight, 2.5)
-isw_ci_diff_upper = np.percentile(is_weight, 97.5)
+isw_ci_diff_lower = np.percentile(is_weight, 0.5)
+isw_ci_diff_upper = np.percentile(is_weight, 99.5)
 
 is_weight = np.clip(is_weight, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
 
@@ -399,9 +400,14 @@ for patient_id in unique_patients:
     # the two-step WIS method, one step to estimate trajectory-level WIS 
     patient_weights = is_weight[patient_mask]
     patient_rewards = test_rewards[patient_mask]
+    weights_per_trajectory_list.append(patient_weights.mean())
+    
+    patient_weights = np.cumprod(patient_weights)
+    patient_weights = np.clip(patient_weights, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
+
     est_total_reward_per_traj = (patient_weights *  patient_rewards).sum() / patient_weights.sum() * len(patient_weights)
     
-    weights_per_trajectory_list.append(patient_weights.mean())
+    #weights_per_trajectory_list.append(patient_weights.mean())
     weighted_rewards_per_trajectory_list.append(est_total_reward_per_traj)
     total_rewards_per_trajectory_list.append(patient_rewards.sum())
 
