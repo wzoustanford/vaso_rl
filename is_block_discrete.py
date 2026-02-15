@@ -577,6 +577,7 @@ print("="*70)
 # For each patient trajectory: WIS_τ = Σᵢ(wᵢ·rᵢ) / Σᵢ(wᵢ) for transitions in that trajectory
 # Then average across all patients
 
+# METHOD 1
 weights_per_trajectory_list = [] 
 total_rewards_per_trajectory_list = []
 weighted_rewards_per_trajectory_list = []
@@ -627,6 +628,81 @@ weighted_rewards_per_trajectory_list = np.array(weighted_rewards_per_trajectory_
 wis_trajectory_level = (weights_per_trajectory_list * weighted_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum() 
 
 #wis_trajectory_level = weighted_rewards_per_trajectory_list.mean()
+
+# METHOD 2:
+#
+# Average across transitions to get per-trajectory return R_j = sum_t r_t,
+# then weight across trajectories with
+#   w_j = prod_t [pi_model(a_t|s_t) / pi_clinician(a_t|s_t)]
+#   R_WIS = sum_j w_j * R_j / sum_j w_j
+# traj_returns_m2 = []
+# traj_weights_m2 = []
+
+# for patient_id in unique_patients:
+#     patient_mask = eval_patient_ids == patient_id
+#     patient_rewards = eval_rewards[patient_mask]
+#     patient_ratios = is_weight[patient_mask]
+
+#     # R_j: total trajectory return
+#     traj_returns_m2.append(patient_rewards.sum())
+
+#     # w_j = prod_t ratio_t, with epsilon guard for numerical stability
+#     patient_weights = np.prod(patient_ratios)
+#     traj_weights_m2.append(patient_weights)
+
+# traj_returns_m2 = np.array(traj_returns_m2)
+# traj_weights_m2 = np.array(traj_weights_m2)
+
+# total_rewards_per_trajectory_list = traj_returns_m2
+# weighted_rewards_per_trajectory_list = total_rewards_per_trajectory_list.copy()
+# weights_per_trajectory_list = traj_weights_m2
+
+# if weights_per_trajectory_list.sum() > 0:
+#     wis_trajectory_level = (weights_per_trajectory_list * total_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum()
+# else:
+#     wis_trajectory_level = 0.0
+
+
+# METHOD 3:
+#
+# Weight across transitions, average across trajectories:
+#   w_j = prod_{t_i=0}^j [pi_model(a_{t_i}|s_{t_i}) / pi_clinician(a_{t_i}|s_{t_i})]
+#   R_traj = T * (sum_j w_j * R_j) / (sum_j w_j)
+#   R_WIS = (1/N) * sum_i R_traj^{(i)}
+# weights_per_trajectory_list = [] 
+# total_rewards_per_trajectory_list = []
+# weighted_rewards_per_trajectory_list = []
+
+# for patient_id in unique_patients:
+#     patient_mask = eval_patient_ids == patient_id
+#     patient_rewards = eval_rewards[patient_mask]
+#     patient_ratios = np.clip(is_weight[patient_mask], eps, None)
+
+#     # Transition-level cumulative products: w_j = prod_{t<=j} ratio_t
+#     cumulative_weights = np.cumprod(patient_ratios)
+
+#     # R_traj = T * sum_j(w_j * r_j) / sum_j(w_j)
+#     T = len(patient_rewards)
+#     if T > 0 and cumulative_weights.sum() > 0:
+#         est_total_reward_per_traj = T * (cumulative_weights * patient_rewards).sum() / cumulative_weights.sum()
+#     else:
+#         est_total_reward_per_traj = 0.0
+
+#     # Store raw trajectory return and model-estimated trajectory return
+#     total_rewards_per_trajectory_list.append(patient_rewards.sum())
+#     weighted_rewards_per_trajectory_list.append(est_total_reward_per_traj)
+
+#     # Method 3 averages across trajectories equally (not weighted across trajectories)
+#     weights_per_trajectory_list.append(1.0)
+
+# # Compute mean WIS across all trajectories
+# weights_per_trajectory_list = np.array(weights_per_trajectory_list)
+# total_rewards_per_trajectory_list = np.array(total_rewards_per_trajectory_list)
+# weighted_rewards_per_trajectory_list = np.array(weighted_rewards_per_trajectory_list)
+
+# wis_trajectory_level = weighted_rewards_per_trajectory_list.mean() if len(weighted_rewards_per_trajectory_list) > 0 else 0.0
+
+
 
 # Also compute raw clinician per-trajectory for comparison
 clinician_per_trajectory_mean = total_rewards_per_trajectory_list.mean()
