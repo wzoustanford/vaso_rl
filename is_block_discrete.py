@@ -36,11 +36,19 @@ parser.add_argument('--eval_data_path', type=str, default=None,
                         'dual-dataset mode where this dataset is split 50/50 into val/test.')
 parser.add_argument('--use_lstm', action='store_true',
                    help='Use LSTM Q-network instead of standard feedforward network')
+parser.add_argument('--disable_is_clipping', action='store_true',
+                   help='Disable percentile-based clipping for IS weights and trajectory multiplied weights')
+parser.add_argument('--is_clip_lower_pct', type=float, default=0.5,
+                   help='Lower percentile for IS weight clipping (default: 0.5)')
+parser.add_argument('--is_clip_upper_pct', type=float, default=99.5,
+                   help='Upper percentile for IS weight clipping (default: 99.5)')
 args = parser.parse_args()
 
 # Validate arguments
 if args.reward_type == 'irl' and args.irl_model_path is None:
     parser.error("--irl_model_path is required when --reward_type=irl")
+if not (0.0 <= args.is_clip_lower_pct < args.is_clip_upper_pct <= 100.0):
+    parser.error("--is_clip_lower_pct and --is_clip_upper_pct must satisfy 0 <= lower < upper <= 100")
 
 n_bins = args.vp2_bins
 model_path = args.model_path
@@ -48,6 +56,7 @@ eval_set = args.eval_set
 reward_type = args.reward_type
 irl_model_path = args.irl_model_path
 use_lstm = args.use_lstm
+use_is_clipping = not args.disable_is_clipping
 
 # Define constants
 STATE_DIM = 17  # 17 state features for dual model
@@ -417,11 +426,16 @@ eps = 1e-10
 # IS_weight = π_model(a_clinician|s) / π_clinician(a_clinician|s)
 is_weight = eval_prob_model / (eval_prob_clinician + eps)
 
-isw_ci_diff_lower = np.percentile(is_weight, 0.5) #2.5
-isw_ci_diff_upper = np.percentile(is_weight, 99.5) #97.5
-
-#is_weight = np.clip(is_weight, a_min = CLIP_MIN, a_max = CLIP_MAX)
-is_weight = np.clip(is_weight, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
+if use_is_clipping:
+    isw_ci_diff_lower = np.percentile(is_weight, args.is_clip_lower_pct)
+    isw_ci_diff_upper = np.percentile(is_weight, args.is_clip_upper_pct)
+    is_weight = np.clip(is_weight, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+    print(f"  IS clipping enabled with percentiles [{args.is_clip_lower_pct}, {args.is_clip_upper_pct}]")
+    print(f"  IS clipping bounds: [{isw_ci_diff_lower:.6f}, {isw_ci_diff_upper:.6f}]")
+else:
+    isw_ci_diff_lower = None
+    isw_ci_diff_upper = None
+    print("  IS clipping disabled")
 
 #is_weight = np.cumprod(is_weight)
 
@@ -577,6 +591,7 @@ print("="*70)
 # For each patient trajectory: WIS_τ = Σᵢ(wᵢ·rᵢ) / Σᵢ(wᵢ) for transitions in that trajectory
 # Then average across all patients
 
+# METHOD 1
 weights_per_trajectory_list = [] 
 total_rewards_per_trajectory_list = []
 weighted_rewards_per_trajectory_list = []
@@ -603,7 +618,8 @@ for patient_id in unique_patients:
     weights_per_trajectory_list.append(patient_weights.mean())
 
     patient_weights = np.cumprod(patient_weights)
-    patient_weights = np.clip(patient_weights, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
+    if use_is_clipping:
+        patient_weights = np.clip(patient_weights, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
     
     # np.clip(is_weight, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
     est_total_reward_per_traj = (patient_weights *  patient_rewards).sum() / patient_weights.sum() * len(patient_weights)
@@ -627,6 +643,86 @@ weighted_rewards_per_trajectory_list = np.array(weighted_rewards_per_trajectory_
 wis_trajectory_level = (weights_per_trajectory_list * weighted_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum() 
 
 #wis_trajectory_level = weighted_rewards_per_trajectory_list.mean()
+
+# METHOD 2:
+#
+# Average across transitions to get per-trajectory return R_j = sum_t r_t,
+# then weight across trajectories with
+#   w_j = prod_t [pi_model(a_t|s_t) / pi_clinician(a_t|s_t)]
+#   R_WIS = sum_j w_j * R_j / sum_j w_j
+# trajectory_returns_method2 = []
+# trajectory_is_weights_method2 = []
+
+# for patient_id in unique_patients:
+#     patient_mask = eval_patient_ids == patient_id
+#     patient_rewards = eval_rewards[patient_mask]
+#     trajectory_step_ratios = is_weight[patient_mask]
+#     if use_is_clipping:
+#         trajectory_step_ratios = np.clip(trajectory_step_ratios, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+
+#     # R_j: total trajectory return
+#     trajectory_returns_method2.append(patient_rewards.sum())
+
+#     # w_j = prod_t ratio_t, with epsilon guard for numerical stability
+#     trajectory_weight = np.prod(trajectory_step_ratios)
+#     if use_is_clipping:
+#         trajectory_weight = np.clip(trajectory_weight, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+#     trajectory_is_weights_method2.append(trajectory_weight)
+
+# total_rewards_per_trajectory_list = np.array(trajectory_returns_method2)
+# weights_per_trajectory_list = np.array(trajectory_is_weights_method2)
+# weighted_rewards_per_trajectory_list = total_rewards_per_trajectory_list.copy()
+
+# if weights_per_trajectory_list.sum() > 0:
+#     wis_trajectory_level = (weights_per_trajectory_list * total_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum()
+# else:
+#     wis_trajectory_level = 0.0
+
+
+# METHOD 3:
+#
+# Weight across transitions, average across trajectories:
+#   w_j = prod_{t_i=0}^j [pi_model(a_{t_i}|s_{t_i}) / pi_clinician(a_{t_i}|s_{t_i})]
+#   R_traj = T * (sum_j w_j * R_j) / (sum_j w_j)
+#   R_WIS = (1/N) * sum_i R_traj^{(i)}
+# weights_per_trajectory_list = [] 
+# total_rewards_per_trajectory_list = []
+# weighted_rewards_per_trajectory_list = []
+
+# for patient_id in unique_patients:
+#     patient_mask = eval_patient_ids == patient_id
+#     patient_rewards = eval_rewards[patient_mask]
+#     patient_ratios = np.clip(is_weight[patient_mask], eps, None)
+#     if use_is_clipping:
+#         patient_ratios = np.clip(patient_ratios, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+
+#     # Transition-level cumulative products: w_j = prod_{t<=j} ratio_t
+#     cumulative_weights = np.cumprod(patient_ratios)
+#     if use_is_clipping:
+#         cumulative_weights = np.clip(cumulative_weights, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+
+#     # R_traj = T * sum_j(w_j * r_j) / sum_j(w_j)
+#     T = len(patient_rewards)
+#     if T > 0 and cumulative_weights.sum() > 0:
+#         est_total_reward_per_traj = T * (cumulative_weights * patient_rewards).sum() / cumulative_weights.sum()
+#     else:
+#         est_total_reward_per_traj = 0.0
+
+#     # Store raw trajectory return and model-estimated trajectory return
+#     total_rewards_per_trajectory_list.append(patient_rewards.sum())
+#     weighted_rewards_per_trajectory_list.append(est_total_reward_per_traj)
+
+#     # Method 3 averages across trajectories equally (not weighted across trajectories)
+#     weights_per_trajectory_list.append(1.0)
+
+# # Compute mean WIS across all trajectories
+# weights_per_trajectory_list = np.array(weights_per_trajectory_list)
+# total_rewards_per_trajectory_list = np.array(total_rewards_per_trajectory_list)
+# weighted_rewards_per_trajectory_list = np.array(weighted_rewards_per_trajectory_list)
+
+# wis_trajectory_level = weighted_rewards_per_trajectory_list.mean() if len(weighted_rewards_per_trajectory_list) > 0 else 0.0
+
+
 
 # Also compute raw clinician per-trajectory for comparison
 clinician_per_trajectory_mean = total_rewards_per_trajectory_list.mean()
