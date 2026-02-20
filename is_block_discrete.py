@@ -139,6 +139,8 @@ if reward_type == 'irl':
         pipeline.load_gcl_reward_model(irl_model_path)
     elif 'maxent' in irl_model_path.lower():
         pipeline.load_maxent_reward_model(irl_model_path)
+    elif 'airl' in irl_model_path.lower():
+        pipeline.load_airl_reward_model(irl_model_path)
     elif 'semi_supervised_unet' in irl_model_path.lower():
         pipeline.load_semi_supervised_unet_reward_model(irl_model_path, vp1_bins=2, vp2_bins=n_bins)
     elif 'unet' in irl_model_path.lower():
@@ -692,7 +694,7 @@ wis_trajectory_level = (weights_per_trajectory_list * weighted_rewards_per_traje
 # for patient_id in unique_patients:
 #     patient_mask = eval_patient_ids == patient_id
 #     patient_rewards = eval_rewards[patient_mask]
-#     patient_ratios = np.clip(is_weight[patient_mask], eps, None)
+#     patient_ratios = is_weight[patient_mask]
 #     if use_is_clipping:
 #         patient_ratios = np.clip(patient_ratios, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
 

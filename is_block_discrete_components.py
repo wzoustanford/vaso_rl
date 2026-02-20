@@ -47,8 +47,8 @@ IRL_MODEL_PATHS = {
     'unet_tanh': 'experiments/unet_reward_gen_h64_tanh/model_epoch_100.pt',
     'semi_sup_unet': 'experiments/semi_supervised_unet_64/model_epoch_100.pt',
     'maxent_irl': 'experiment/irl/maxent_reward_model.pt',
-    'gcl': '/scratch/zouwil/code/vaso_rl/experiment/irl/gcl_tau0.005_lr0.001_clr0.01_cost_model.pt',
-    'iq_learn': '/scratch/zouwil/code/vaso_rl/experiment/irl/iq_learn_temp0.001_tau0.005_lr0.001_divjs_q_model.pt',
+    'gcl': '/scratch/code/vaso_rl/experiment/irl/gcl_tau0.005_lr0.001_clr0.01_cost_model.pt',
+    'iq_learn': '/scratch/code/vaso_rl/experiment/irl/iq_learn_temp0.001_tau0.005_lr0.001_divjs_q_model.pt',
 }
 
 # Q-learning model paths (trained with each IRL reward)

@@ -340,7 +340,7 @@ def train_block_discrete_cql(
         alpha: CQL penalty strength
         vp2_bins: Number of bins for VP2 discretization (for Q-learning action space)
         epochs: Number of training epochs
-        reward_model_path: Path to learned reward model (gcl/iq_learn/maxent/unet)
+        reward_model_path: Path to learned reward model (gcl/iq_learn/maxent/airl/unet)
         suffix: Suffix to add to experiment prefix
         save_dir: Directory to save models
         reward_combine_lambda: If None, use pure IRL reward. If in [0, 1], use
@@ -397,6 +397,15 @@ def train_block_discrete_cql(
             eval_data_path=eval_data_path
         )
         pipeline.load_maxent_reward_model(reward_model_path)
+    elif 'airl' in reward_model_path:
+        reward_type = "airl"
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
+        )
+        pipeline.load_airl_reward_model(reward_model_path)
     elif 'semi_supervised_unet' in reward_model_path:
         # Semi-supervised U-Net provides learned rewards via per-trajectory inference
         reward_type = "semi_supervised_unet"
@@ -581,7 +590,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=100,
                        help='Number of training epochs (default: 100)')
     parser.add_argument('--reward_model_path', type=str, default=None,
-                       help='Path to learned reward model (gcl/iq_learn/maxent). None=manual reward')
+                       help='Path to learned reward model (gcl/iq_learn/maxent/airl/unet). None=manual reward')
     parser.add_argument('--suffix', type=str, default='',
                        help='Suffix to add to experiment prefix (e.g., "_irl100")')
     parser.add_argument('--save_dir', type=str, default='experiment/ql',
