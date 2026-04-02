@@ -22,8 +22,8 @@ class Config:
     """Configuration for transformer reward generator training."""
     # Model architecture (state_size inferred from data)
     d_model: int = 128            # Transformer hidden dimension
-    nhead: int = 8                # Number of attention heads
-    num_layers: int = 4           # Number of transformer encoder layers
+    nhead: int = 2                # Number of attention heads
+    num_layers: int = 2           # Number of transformer encoder layers
     d_ff: int = 512               # Feedforward hidden dimension
     dropout: float = 0.1          # Transformer dropout
 
@@ -49,7 +49,7 @@ class Config:
     overlap: int = 1              # As specified in prompts
 
     # Paths
-    experiment_dir: str = "experiments/unet_reward_gen_fixed_32"
+    experiment_dir: str = "experiments/transformer_reward_gen"
 
     def __init__(self, **kwargs):
         for key, value in kwargs.items():
@@ -60,7 +60,7 @@ class Config:
 
 ## Transformer Architecture
 # keep the class name for consistency
-class UNetRewardGenerator(nn.Module):
+class TransformerCIRLRewardGenerator(nn.Module):
     """
     Transformer reward model that takes trajectories and outputs per-timestep rewards.
 
@@ -198,7 +198,7 @@ def load_trajectories(data_pipeline, config: Config) -> tuple:
 
 
 def compute_training_step(
-    model: UNetRewardGenerator,
+    model: TransformerCIRLRewardGenerator,
     states: torch.Tensor,
     actions: torch.Tensor,
     config: Config,
@@ -208,7 +208,7 @@ def compute_training_step(
     Compute loss for one batch of sequences.
 
     Args:
-        model: UNetRewardGenerator
+        model: TransformerCIRLRewardGenerator
         states: [batch, seq_len, state_size]
         actions: [batch, seq_len, 2] - expert actions (vp1, vp2) continuous
         config: Configuration
@@ -292,7 +292,7 @@ def compute_training_step(
 
 
 def evaluate_validation(
-    model: UNetRewardGenerator,
+    model: TransformerCIRLRewardGenerator,
     val_buffer,
     config: Config,
     device: torch.device
@@ -403,7 +403,7 @@ def train(config: Config, data_pipeline):
 
     # Initialize model
     print(f"[DEBUG] Initializing transformer reward generator with state_size={state_size}, action_size={config.action_size}")
-    model = UNetRewardGenerator(
+    model = TransformerCIRLRewardGenerator(
         state_size=state_size,
         action_size=config.action_size,
         d_model=config.d_model,
@@ -471,7 +471,7 @@ def train(config: Config, data_pipeline):
         print(f"Epoch {epoch+1}/{config.num_epochs} complete")
 
         # Save model each epoch
-        save_path = os.path.join(config.experiment_dir, f"model_epoch_{epoch+1}.pt")
+        save_path = os.path.join(config.experiment_dir, f"transformer_context_irl_model_epoch_{epoch+1}.pt")
         save_model(model, config, save_path)
 
     print("Training complete!")
@@ -480,12 +480,12 @@ def train(config: Config, data_pipeline):
 
 ## Model saving and loading functions
 
-def save_model(model: UNetRewardGenerator, config: Config, filepath: str):
+def save_model(model: TransformerCIRLRewardGenerator, config: Config, filepath: str):
     """
     Save model checkpoint.
 
     Args:
-        model: UNetRewardGenerator model
+        model: TransformerCIRLRewardGenerator model
         config: Configuration object
         filepath: Path to save the model
     """
@@ -531,7 +531,7 @@ def load_model(filepath: str, device: torch.device = None) -> tuple:
 
     checkpoint = torch.load(filepath, map_location=device)
 
-    model = UNetRewardGenerator(
+    model = TransformerCIRLRewardGenerator(
         state_size=checkpoint['state_size'],
         action_size=checkpoint['action_size'],
         d_model=checkpoint['d_model'],
@@ -560,8 +560,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--d_model', type=int, default=128, help='Transformer hidden dimension')
-    parser.add_argument('--nhead', type=int, default=8, help='Number of attention heads')
-    parser.add_argument('--num_layers', type=int, default=4, help='Number of transformer layers')
+    parser.add_argument('--nhead', type=int, default=2, help='Number of attention heads')
+    parser.add_argument('--num_layers', type=int, default=2, help='Number of transformer layers')
     parser.add_argument('--d_ff', type=int, default=512, help='Transformer feedforward dimension')
     parser.add_argument('--dropout', type=float, default=0.1, help='Transformer dropout')
     parser.add_argument('--D', type=int, default=10, help='Q-value horizon')

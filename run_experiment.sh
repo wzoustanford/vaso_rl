@@ -425,6 +425,62 @@ else
                 exit 1
             fi
             ;;
+        unet_maxent)
+            UNET_DIR="${EXPERIMENT_DIR}/unet${SUFFIX}"
+            mkdir -p "$UNET_DIR"
+            UNET_CMD="python ${SCRIPT_DIR}/unet_reward_generator_tanh_maxent.py \
+                --epochs $UNET_EPOCHS \
+                --conv_h_dim $UNET_CONV_H_DIM \
+                --D $UNET_D \
+                --gamma $UNET_GAMMA \
+                --lr $UNET_LR \
+                --vp2_bins $VP2_BINS \
+                --experiment_dir $UNET_DIR"
+            if [ -n "$COMBINED_OR_TRAIN_DATA_PATH" ]; then
+                UNET_CMD="$UNET_CMD --combined_or_train_data_path $COMBINED_OR_TRAIN_DATA_PATH"
+            fi
+            if [ -n "$EVAL_DATA_PATH" ]; then
+                UNET_CMD="$UNET_CMD --eval_data_path $EVAL_DATA_PATH"
+            fi
+            if [ -n "$UNET_ABLATION" ]; then
+                UNET_CMD="$UNET_CMD --ablation_setting $UNET_ABLATION"
+            fi
+            eval $UNET_CMD
+            # Find the latest model (tanh version adds _tanh suffix)
+            REWARD_MODEL_PATH=$(ls -t "${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"/unet_maxent_model_epoch_*.pt 2>/dev/null | head -1)
+            if [ -z "$REWARD_MODEL_PATH" ]; then
+                echo "Error: No U-Net model found in ${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"
+                exit 1
+            fi
+            ;;
+        transformer_context_irl)
+            UNET_DIR="${EXPERIMENT_DIR}/unet${SUFFIX}"
+            mkdir -p "$UNET_DIR"
+            UNET_CMD="python ${SCRIPT_DIR}/unet_reward_generator_tanh_maxent.py \
+                --epochs $UNET_EPOCHS \
+                --conv_h_dim $UNET_CONV_H_DIM \
+                --D $UNET_D \
+                --gamma $UNET_GAMMA \
+                --lr $UNET_LR \
+                --vp2_bins $VP2_BINS \
+                --experiment_dir $UNET_DIR"
+            if [ -n "$COMBINED_OR_TRAIN_DATA_PATH" ]; then
+                UNET_CMD="$UNET_CMD --combined_or_train_data_path $COMBINED_OR_TRAIN_DATA_PATH"
+            fi
+            if [ -n "$EVAL_DATA_PATH" ]; then
+                UNET_CMD="$UNET_CMD --eval_data_path $EVAL_DATA_PATH"
+            fi
+            if [ -n "$UNET_ABLATION" ]; then
+                UNET_CMD="$UNET_CMD --ablation_setting $UNET_ABLATION"
+            fi
+            eval $UNET_CMD
+            # Find the latest model (tanh version adds _tanh suffix)
+            REWARD_MODEL_PATH=$(ls -t "${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"/transformer_context_irl_model_epoch_*.pt 2>/dev/null | head -1)
+            if [ -z "$REWARD_MODEL_PATH" ]; then
+                echo "Error: No U-Net model found in ${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"
+                exit 1
+            fi
+            ;;
         semi_supervised_unet)
             UNET_DIR="${EXPERIMENT_DIR}/semi_supervised_unet${SUFFIX}"
             mkdir -p "$UNET_DIR"
