@@ -398,7 +398,7 @@ else
             REWARD_MODEL_PATH="${IRL_DIR}/iq_learn${SUFFIX}_q_model.pt"
             ;;
         unet)
-            UNET_DIR="${EXPERIMENT_DIR}/unet${SUFFIX}"
+            UNET_DIR="${EXPERIMENT_DIR}/unet_${SUFFIX}"
             mkdir -p "$UNET_DIR"
             UNET_CMD="python ${SCRIPT_DIR}/unet_reward_generator_tanh.py \
                 --epochs $UNET_EPOCHS \
@@ -426,7 +426,7 @@ else
             fi
             ;;
         unet_maxent)
-            UNET_DIR="${EXPERIMENT_DIR}/unet${SUFFIX}"
+            UNET_DIR="${EXPERIMENT_DIR}/unet_${SUFFIX}"
             mkdir -p "$UNET_DIR"
             UNET_CMD="python ${SCRIPT_DIR}/unet_reward_generator_tanh_maxent.py \
                 --epochs $UNET_EPOCHS \
@@ -454,11 +454,11 @@ else
             fi
             ;;
         transformer_context_irl)
-            UNET_DIR="${EXPERIMENT_DIR}/unet${SUFFIX}"
+            UNET_DIR="${EXPERIMENT_DIR}/transformer_${SUFFIX}"
             mkdir -p "$UNET_DIR"
-            UNET_CMD="python ${SCRIPT_DIR}/unet_reward_generator_tanh_maxent.py \
+            UNET_CMD="python ${SCRIPT_DIR}/transformer_reward_generator_tanh.py \
                 --epochs $UNET_EPOCHS \
-                --conv_h_dim $UNET_CONV_H_DIM \
+                --d_model $UNET_CONV_H_DIM \
                 --D $UNET_D \
                 --gamma $UNET_GAMMA \
                 --lr $UNET_LR \
