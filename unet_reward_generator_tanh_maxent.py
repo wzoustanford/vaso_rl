@@ -454,7 +454,7 @@ def train(config: Config, data_pipeline):
         print(f"Epoch {epoch+1}/{config.num_epochs} complete")
 
         # Save model each epoch
-        save_path = os.path.join(config.experiment_dir, f"model_epoch_{epoch+1}.pt")
+        save_path = os.path.join(config.experiment_dir, f"unet_maxent_model_epoch_{epoch+1}.pt")
         save_model(model, config, save_path)
 
     print("Training complete!")

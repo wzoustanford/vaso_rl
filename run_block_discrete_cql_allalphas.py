@@ -578,7 +578,7 @@ def main():
                        help='Alpha values for CQL penalty (default: 0.0)')
     parser.add_argument('--single_alpha', type=float, default=None,
                        help='Train only with a single alpha value (overrides --alphas)')
-    parser.add_argument('--epochs', type=int, default=100,
+    parser.add_argument('--epochs', type=int, default=50,
                        help='Number of training epochs (default: 100)')
     parser.add_argument('--reward_model_path', type=str, default=None,
                        help='Path to learned reward model (gcl/iq_learn/maxent). None=manual reward')
