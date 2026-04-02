@@ -59,120 +59,6 @@ class Config:
         self.action_size = self.vp1_bins * self.vp2_bins
 
 ## U-Net Architecture for Variable-Length Sequence Reward Generation
-class YNetRewardGenerator(nn.Module):
-    """
-    U-Net that takes variable-length trajectories and outputs per-timestep rewards.
-
-    Input: [batch, seq_len, state_size + action_size]
-    Output: [batch, seq_len, 1] (reward per timestep)
-    """
-
-    def __init__(self, state_size: int, action_size: int, conv_h_dim: int = 64):
-        super().__init__()
-        self.state_size = state_size
-        self.action_size = action_size
-        self.input_size = state_size + action_size
-        self.conv_h_dim = conv_h_dim
-        self.bottleneck_dim = conv_h_dim * 2  # 128
-
-        # Encoder: 3 conv layers (no padding, shrinks by 2 per layer)
-        # L -> L-2 -> L-4 -> L-6 (bottleneck)
-        self.enc1 = nn.Sequential(
-            nn.Conv1d(self.input_size, conv_h_dim, kernel_size=3),
-            #nn.BatchNorm1d(conv_h_dim),
-            nn.ReLU()
-        )
-        self.enc2 = nn.Sequential(
-            nn.Conv1d(conv_h_dim, conv_h_dim, kernel_size=3),
-            #nn.BatchNorm1d(conv_h_dim),
-            nn.ReLU()
-        )
-        self.enc3 = nn.Sequential(
-            nn.Conv1d(conv_h_dim, conv_h_dim * 2, kernel_size=3),  # bottleneck: [batch, 128, L-6]
-            #nn.BatchNorm1d(conv_h_dim * 2),
-            nn.ReLU()
-        )
-
-        # Decoder: 3 ConvTranspose1d layers (no padding, grows by 2 per layer)
-        # L-6 -> L-4 -> L-2 -> L
-        self.dec3 = nn.Sequential(
-            nn.ConvTranspose1d(conv_h_dim * 2, conv_h_dim, kernel_size=3),  # 128 -> 64, L-6 -> L-4
-            #nn.BatchNorm1d(conv_h_dim),
-            nn.ReLU()
-        )
-        self.dec2 = nn.Sequential(
-            nn.ConvTranspose1d(conv_h_dim + conv_h_dim, conv_h_dim, kernel_size=3),  # 64+64 -> 64, L-4 -> L-2
-            #nn.BatchNorm1d(conv_h_dim),
-            nn.ReLU()
-        )
-        self.dec1 = nn.Sequential(
-            nn.ConvTranspose1d(conv_h_dim + conv_h_dim, conv_h_dim, kernel_size=3),  # 64+64 -> 64, L-2 -> L
-            #nn.BatchNorm1d(conv_h_dim),
-            nn.ReLU()
-        )
-
-        # Output layer: produces 1 reward per timestep
-        self.output_layer = nn.Sequential(
-            nn.Conv1d(conv_h_dim, 1, kernel_size=1),
-            nn.Tanh()
-        )
-    
-    def encode(self, x: torch.Tensor) -> tuple:
-        """
-        Encode input sequence through conv layers.
-
-        Args:
-            x: [batch, seq_len, state_size + action_size]
-        Returns:
-            bottleneck: [batch, 128, L-6]
-            skip_connections: (e1, e2) for decoder
-        """
-        # Conv1d expects [batch, channels, seq_len]
-        x = x.permute(0, 2, 1)
-
-        # Encoder
-        e1 = self.enc1(x)    # [batch, 64, L-2]
-        e2 = self.enc2(e1)   # [batch, 64, L-4]
-        e3 = self.enc3(e2)   # [batch, 128, L-6] (bottleneck)
-
-        return e3, (e1, e2)
-
-    def decode(self, bottleneck: torch.Tensor, skip_connections: tuple) -> torch.Tensor:
-        """
-        Decode bottleneck back to per-timestep rewards using transposed convolutions.
-
-        Args:
-            bottleneck: [batch, 128, L-6]
-            skip_connections: (e1, e2) from encoder
-        Returns:
-            rewards: [batch, L, 1]
-        """
-        e1, e2 = skip_connections
-
-        # Decoder with skip connections
-        d3 = self.dec3(bottleneck)                  # [batch, 64, L-4]
-        d2 = self.dec2(torch.cat([d3, e2], dim=1))  # [batch, 64, L-2]
-        d1 = self.dec1(torch.cat([d2, e1], dim=1))  # [batch, 64, L]
-
-        # Output: reward per timestep
-        out = self.output_layer(d1)  # [batch, 1, L]
-
-        # Return as [batch, L, 1]
-        return out.permute(0, 2, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [batch, seq_len, state_size + action_size]
-        Returns:
-            rewards: [batch, seq_len, 1]
-        """
-        bottleneck, skip_connections = self.encode(x)
-        rewards = self.decode(bottleneck, skip_connections)
-        return rewards
-
-
-## U-Net Architecture for Variable-Length Sequence Reward Generation
 class UNetRewardGenerator(nn.Module):
     """
     U-Net that takes variable-length trajectories and outputs per-timestep rewards.
@@ -406,7 +292,7 @@ def compute_training_step(
             state_action_flat[:, ct+1:, :] = 0 
         elif config.ablation_setting == "single_transition_context": 
             state_action_flat[:, ct+1:, :] = 0 
-            state_action_flat[:, :ct-1, :] = 0
+            state_action_flat[:, :ct, :] = 0
         
         rewards_pred = model(state_action_flat)
         rewards_pred = rewards_pred.reshape(batch_size, action_size, seq_len, 1)

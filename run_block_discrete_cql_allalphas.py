@@ -425,11 +425,11 @@ def train_block_discrete_cql(
         print(f"  IRL model vp2_bins: {irl_vp2_bins}, Q-learning vp2_bins: {vp2_bins}")
     else:
         raise ValueError(f"Cannot infer reward model type from path: {reward_model_path}")
-
+    
     # Use pipeline's get_reward_prefix for correct naming with lambda
     experiment_prefix = pipeline.get_reward_prefix() if hasattr(pipeline, 'get_reward_prefix') else reward_type
-    experiment_prefix = f"{experiment_prefix}{suffix}"
-
+    experiment_prefix = f"{experiment_prefix}_{suffix}"
+    
     print("="*70, flush=True)
     print(f" BLOCK DISCRETE CQL TRAINING WITH ALPHA={alpha}", flush=True)
     print(f" Reward: {reward_type} | Prefix: {experiment_prefix}", flush=True)
@@ -489,7 +489,6 @@ def train_block_discrete_cql(
         for _ in range(n_batches):
             # Get batch
             batch = pipeline.get_batch(batch_size=batch_size, split='train')
-            
             # Convert to tensors
             states = torch.FloatTensor(batch['states']).to(agent.device)
             actions = torch.FloatTensor(batch['actions']).to(agent.device)
@@ -540,6 +539,7 @@ def train_block_discrete_cql(
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            print(f'saving best model at {save_dir}/{experiment_prefix}_alpha{alpha:.4f}_bins{vp2_bins}_best.pt')
             agent.save(f'{save_dir}/{experiment_prefix}_alpha{alpha:.4f}_bins{vp2_bins}_best.pt')
         
         # Print progress

@@ -51,7 +51,7 @@ IQ_LR=1e-4
 IQ_DIV="chi"
 
 # U-Net-specific defaults
-UNET_EPOCHS=500
+UNET_EPOCHS=100
 UNET_CONV_H_DIM=64
 UNET_D=5
 UNET_GAMMA=0.99
@@ -527,6 +527,7 @@ if [ "$USE_LSTM" == "true" ]; then
 else
     # Build standard Q-Learning command
     QL_CMD="python ${SCRIPT_DIR}/run_block_discrete_cql_allalphas.py \
+	--suffix $SUFFIX \
         --single_alpha 0.0 \
         --vp2_bins $VP2_BINS \
         --epochs $QL_EPOCHS \
@@ -563,7 +564,7 @@ else
         LAMBDA_STR=$(echo "$REWARD_COMBINE_LAMBDA" | sed 's/0*$//' | sed 's/\.$//')
         MODEL_PREFIX="${ALGORITHM}_combined_manual_lambda${LAMBDA_STR}${SUFFIX}"
     else
-        MODEL_PREFIX="${ALGORITHM}${SUFFIX}"
+        MODEL_PREFIX="${ALGORITHM}_${SUFFIX}"
     fi
 fi
 
