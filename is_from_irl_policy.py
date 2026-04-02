@@ -14,7 +14,7 @@ warnings.filterwarnings('ignore')
 
 # Import project modules
 from integrated_data_pipeline_v3 import IntegratedDataPipelineV3
-from unet_reward_generator import UNetRewardGenerator, Config
+from unet_reward_generator_tanh import UNetRewardGenerator, Config
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Importance Sampling evaluation for IRL Policy Models')
