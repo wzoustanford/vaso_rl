@@ -107,9 +107,12 @@ class UNetRewardGenerator(nn.Module):
             #nn.BatchNorm1d(conv_h_dim),
             nn.ReLU()
         )
-        
+
         # Output layer: produces 1 reward per timestep
-        self.output_layer = nn.Conv1d(conv_h_dim, 1, kernel_size=1)
+        self.output_layer = nn.Sequential(
+            nn.Conv1d(conv_h_dim, 1, kernel_size=1),
+            nn.Tanh()
+        )
     
     def encode(self, x: torch.Tensor) -> tuple:
         """
@@ -225,7 +228,7 @@ def compute_training_step(
     device: torch.device
 ) -> tuple:
     """
-    Compute loss for one batch of sequences.
+    Compute a trajectory-level maximum-entropy loss for one batch.
 
     Args:
         model: UNetRewardGenerator
@@ -235,90 +238,42 @@ def compute_training_step(
         device: torch.device
     Returns:
         loss: scalar loss
-        metrics: dict with Q values and accuracy
+        metrics: dict with trajectory-level reward and accuracy metrics
     """
-    batch_size, seq_len, state_size = states.shape
-    action_size = config.action_size
+    batch_size, _, _ = states.shape
 
-    # --- Block 6b-3: Convert expert actions to discrete indices ---
     converter = DualBlockDiscreteCQL(state_dim=1, vp2_bins=config.vp2_bins)
     expert_action_idx = torch.tensor([
         [converter.continuous_to_discrete_action(actions[b, t].cpu().numpy())
-         for t in range(seq_len)]
+         for t in range(actions.shape[1])]
         for b in range(batch_size)
     ], device=device)
 
-    # Debug: Check action indices are within bounds
-    max_idx = expert_action_idx.max().item()
-    min_idx = expert_action_idx.min().item()
-    if max_idx >= action_size or min_idx < 0:
-        print(f"ERROR: Action index out of bounds! max_idx={max_idx}, min_idx={min_idx}, action_size={action_size}")
-        print(f"  config.vp2_bins={config.vp2_bins}, converter.vp2_bins={converter.vp2_bins}")
-        print(f"  converter.total_actions={converter.total_actions}")
-        # Sample some actions to debug
-        sample_actions = actions[0, :5].cpu().numpy()
-        print(f"  Sample actions: {sample_actions}")
-        sample_indices = [converter.continuous_to_discrete_action(actions[0, t].cpu().numpy()) for t in range(5)]
-        print(f"  Sample indices: {sample_indices}")
-
-    # --- Block 6b-4, 6b-5: Compute Q values and loss ---
-    D = config.D
-    gamma = config.gamma
-    discount = torch.tensor([gamma ** t for t in range(D)], device=device)
-
-    total_loss = 0.0
-    q_values_list = []
-    correct_predictions = 0
-    total_predictions = 0
-
     # Convert expert actions to one-hot: [batch, seq_len] -> [batch, seq_len, action_size]
-    expert_action_one_hot = F.one_hot(expert_action_idx, num_classes=action_size).float()
+    expert_action_one_hot = F.one_hot(expert_action_idx, num_classes=config.action_size).float()
+    state_action = torch.cat([states, expert_action_one_hot], dim=-1)
 
-    # Expand for all action choices at current timestep
-    # states_expanded: [batch, seq_len, action_size, state_size]
-    states_expanded = states.unsqueeze(2).expand(-1, -1, action_size, -1)
-    # expert_action_expanded: [batch, seq_len, action_size, action_size]
-    expert_action_expanded = expert_action_one_hot.unsqueeze(2).expand(-1, -1, action_size, -1)
+    # input to model: [batch, seq_len, state_size + action_size]
+    # output from model: [batch, seq_len, 1] -> squeeze to [batch, seq_len]
+    rewards_pred = model(state_action).squeeze(-1)
 
-    # Eye matrix for replacing at timestep ct (create once outside loop)
-    # action_eye: [batch, action_size, action_size]
-    action_eye = torch.eye(action_size, device=device).unsqueeze(0).expand(batch_size, -1, -1)
+    # sum rewards across trajectory for each sample: [batch]
+    trajectory_rewards = rewards_pred.sum(dim=1)
 
-    for ct in range(seq_len - D):
+    # Max-ent loss: -log(softmax(trajectory_rewards / temperature))
+    scaled_rewards = trajectory_rewards / config.temperature
+    log_probs = torch.log_softmax(scaled_rewards, dim=0)
+    loss = -log_probs.sum()
 
-        # --- Block 6b-1: Replace expert action at ct with all possible actions ---
-        cur_action_expanded = expert_action_expanded.clone()
-        cur_action_expanded[:, ct, :, :] = action_eye
-        state_action = torch.cat([states_expanded, cur_action_expanded], dim=-1)
-
-        # --- Block 6b-2: Reshape and forward through U-Net ---
-        state_action_flat = state_action.permute(0, 2, 1, 3).reshape(
-            batch_size * action_size, seq_len, state_size + action_size
-        )
-        rewards_pred = model(state_action_flat)
-        rewards_pred = rewards_pred.reshape(batch_size, action_size, seq_len, 1)
-        rewards_pred = rewards_pred.squeeze(-1).permute(0, 2, 1)
-
-        future_rewards = rewards_pred[:, ct:ct+D, :]
-        Q_values = (future_rewards * discount.unsqueeze(0).unsqueeze(-1)).sum(dim=1)
-        Q_logits = F.softmax(Q_values, dim=1)
-        q_values_list.append(Q_values.mean().item())
-
-        expert_idx_ct = expert_action_idx[:, ct]
-        loss_ct = F.cross_entropy(Q_logits, expert_idx_ct, reduction='sum')
-        total_loss += loss_ct
-
-        predicted_action = Q_logits.argmax(dim=-1)
-        correct_predictions += (predicted_action == expert_idx_ct).sum().item()
-        total_predictions += batch_size
-
-    # --- Block 6b-6: Normalize loss ---
-    T = seq_len - D
-    loss = total_loss / (T * batch_size)
+    probs = log_probs.exp()
+    uniform = 1.0 / batch_size
 
     metrics = {
-        'avg_q': np.mean(q_values_list),
-        'accuracy': correct_predictions / total_predictions if total_predictions > 0 else 0.0
+        'avg_q': trajectory_rewards.mean().item(),
+        'accuracy': probs.mean().item(),
+        'avg_log_prob': log_probs.mean().item(),
+        'max_prob': probs.max().item(),
+        'uniform_prob': uniform
     }
 
     return loss, metrics
@@ -572,13 +527,19 @@ def main():
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--conv_h_dim', type=int, default=128, help='Conv hidden dimension')
+    parser.add_argument('--conv_h_dim', type=int, default=64, help='Conv hidden dimension')
     parser.add_argument('--D', type=int, default=10, help='Q-value horizon')
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
     parser.add_argument('--vp1_bins', type=int, default=2, help='VP1 bins')
     parser.add_argument('--vp2_bins', type=int, default=5, help='VP2 bins')
     parser.add_argument('--experiment_dir', type=str, default='experiments/unet_reward_gen',
                        help='Directory to save models')
+    parser.add_argument('--combined_or_train_data_path', type=str, default=None,
+                       help='Path to training dataset. If eval_data_path is also provided, '
+                            'all patients from this dataset are used for training.')
+    parser.add_argument('--eval_data_path', type=str, default=None,
+                       help='Path to evaluation dataset (for val/test). If provided, enables '
+                            'dual-dataset mode where this dataset is split 50/50 into val/test.')
     args = parser.parse_args()
 
     # Initialize config from command line args
@@ -591,7 +552,7 @@ def main():
         gamma=args.gamma,
         vp1_bins=args.vp1_bins,
         vp2_bins=args.vp2_bins,
-        experiment_dir=args.experiment_dir+'_'+str(args.conv_h_dim),
+        experiment_dir=args.experiment_dir+'_'+str(args.conv_h_dim)+'_tanh',
     )
 
     print(f"Config: epochs={config.num_epochs}, batch_size={config.batch_size}, "
@@ -601,10 +562,19 @@ def main():
 
     # Initialize data pipeline (use manual rewards - we generate our own via U-Net)
     print("Initializing data pipeline...")
+    if args.eval_data_path:
+        print(f"  Dataset mode: DUAL-DATASET")
+        print(f"    Train data: {args.combined_or_train_data_path or 'default'}")
+        print(f"    Eval data:  {args.eval_data_path}")
+    else:
+        print(f"  Dataset mode: SINGLE-DATASET")
+        print(f"    Data path: {args.combined_or_train_data_path or 'default'}")
     pipeline = IntegratedDataPipelineV3(
         model_type='dual',
         reward_source='manual',
-        random_seed=42
+        random_seed=42,
+        combined_or_train_data_path=args.combined_or_train_data_path,
+        eval_data_path=args.eval_data_path
     )
 
     # Train model
