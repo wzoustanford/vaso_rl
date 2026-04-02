@@ -559,7 +559,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=128, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--d_model', type=int, default=128, help='Transformer hidden dimension')
+    parser.add_argument('--d_model', type=int, default=64, help='Transformer hidden dimension')
     parser.add_argument('--nhead', type=int, default=2, help='Number of attention heads')
     parser.add_argument('--num_layers', type=int, default=2, help='Number of transformer layers')
     parser.add_argument('--d_ff', type=int, default=512, help='Transformer feedforward dimension')
