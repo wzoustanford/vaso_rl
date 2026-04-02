@@ -10,6 +10,8 @@
 #   ./run_experiment.sh iq_learn --iq_init_temp 0.01 --iq_tau 0.01 --iq_lr 1e-3 --iq_div chi
 #   ./run_experiment.sh unet --unet_epochs 100 --unet_conv_h_dim 16
 #   ./run_experiment.sh unet --skip_irl --irl_model_path experiments/unet/model_epoch_100.pt
+#   ./run_experiment.sh unet --unet_ablation causal  # Run with causal ablation
+#   ./run_experiment.sh unet --unet_ablation single_transition_context  # Run with single transition context
 #   ./run_experiment.sh semi_supervised_unet --unet_epochs 100 --unet_conv_h_dim 64
 #   ./run_experiment.sh manual  # Use manual reward, skip IRL training
 #   ./run_experiment.sh manual --vp2_bins 10  # Use 10 bins for VP2 discretization
@@ -49,11 +51,12 @@ IQ_LR=1e-4
 IQ_DIV="chi"
 
 # U-Net-specific defaults
-UNET_EPOCHS=500
+UNET_EPOCHS=100
 UNET_CONV_H_DIM=64
 UNET_D=5
 UNET_GAMMA=0.99
 UNET_LR=1e-4
+UNET_ABLATION=""  # Empty means no ablation (default)
 SKIP_IRL=false
 
 # IRL model vp2_bins (for loading pre-trained models with different vp2_bins)
@@ -155,6 +158,10 @@ while [[ $# -gt 0 ]]; do
             UNET_LR="$2"
             shift 2
             ;;
+        --unet_ablation)
+            UNET_ABLATION="$2"
+            shift 2
+            ;;
         --skip_irl)
             SKIP_IRL=true
             shift
@@ -254,6 +261,9 @@ if [ "$ALGORITHM" == "unet" ] || [ "$ALGORITHM" == "semi_supervised_unet" ]; the
     echo "U-Net D: $UNET_D"
     echo "U-Net gamma: $UNET_GAMMA"
     echo "U-Net lr: $UNET_LR"
+    if [ -n "$UNET_ABLATION" ]; then
+        echo "U-Net ablation: $UNET_ABLATION"
+    fi
     if [ "$ALGORITHM" == "semi_supervised_unet" ]; then
         echo "Semi-supervised: mortality diffusion ENABLED"
     fi
@@ -404,6 +414,9 @@ else
             if [ -n "$EVAL_DATA_PATH" ]; then
                 UNET_CMD="$UNET_CMD --eval_data_path $EVAL_DATA_PATH"
             fi
+            if [ -n "$UNET_ABLATION" ]; then
+                UNET_CMD="$UNET_CMD --ablation_setting $UNET_ABLATION"
+            fi
             eval $UNET_CMD
             # Find the latest model (tanh version adds _tanh suffix)
             REWARD_MODEL_PATH=$(ls -t "${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"/model_epoch_*.pt 2>/dev/null | head -1)
@@ -514,6 +527,7 @@ if [ "$USE_LSTM" == "true" ]; then
 else
     # Build standard Q-Learning command
     QL_CMD="python ${SCRIPT_DIR}/run_block_discrete_cql_allalphas.py \
+	--suffix $SUFFIX \
         --single_alpha 0.0 \
         --vp2_bins $VP2_BINS \
         --epochs $QL_EPOCHS \
@@ -550,7 +564,7 @@ else
         LAMBDA_STR=$(echo "$REWARD_COMBINE_LAMBDA" | sed 's/0*$//' | sed 's/\.$//')
         MODEL_PREFIX="${ALGORITHM}_combined_manual_lambda${LAMBDA_STR}${SUFFIX}"
     else
-        MODEL_PREFIX="${ALGORITHM}${SUFFIX}"
+        MODEL_PREFIX="${ALGORITHM}_${SUFFIX}"
     fi
 fi
 
