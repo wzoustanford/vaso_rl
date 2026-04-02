@@ -35,6 +35,7 @@ class Config:
     num_epochs: int = 100
     learning_rate: float = 1e-3
     gamma: float = 0.99           # Discount factor for reward aggregation
+    temperature: float = 1.0      # Temperature for trajectory-level max-ent loss
     
     # Evaluation & logging
     num_steps_per_eval_print: int = 50
@@ -225,7 +226,7 @@ def compute_training_step(
     device: torch.device
 ) -> tuple:
     """
-    Compute loss for one batch of sequences.
+    Compute a trajectory-level maximum-entropy loss for one batch.
 
     Args:
         model: UNetRewardGenerator
@@ -235,90 +236,42 @@ def compute_training_step(
         device: torch.device
     Returns:
         loss: scalar loss
-        metrics: dict with Q values and accuracy
+        metrics: dict with trajectory-level reward and accuracy metrics
     """
-    batch_size, seq_len, state_size = states.shape
-    action_size = config.action_size
+    batch_size, _, _ = states.shape
 
-    # --- Block 6b-3: Convert expert actions to discrete indices ---
     converter = DualBlockDiscreteCQL(state_dim=1, vp2_bins=config.vp2_bins)
     expert_action_idx = torch.tensor([
         [converter.continuous_to_discrete_action(actions[b, t].cpu().numpy())
-         for t in range(seq_len)]
+         for t in range(actions.shape[1])]
         for b in range(batch_size)
     ], device=device)
 
-    # Debug: Check action indices are within bounds
-    max_idx = expert_action_idx.max().item()
-    min_idx = expert_action_idx.min().item()
-    if max_idx >= action_size or min_idx < 0:
-        print(f"ERROR: Action index out of bounds! max_idx={max_idx}, min_idx={min_idx}, action_size={action_size}")
-        print(f"  config.vp2_bins={config.vp2_bins}, converter.vp2_bins={converter.vp2_bins}")
-        print(f"  converter.total_actions={converter.total_actions}")
-        # Sample some actions to debug
-        sample_actions = actions[0, :5].cpu().numpy()
-        print(f"  Sample actions: {sample_actions}")
-        sample_indices = [converter.continuous_to_discrete_action(actions[0, t].cpu().numpy()) for t in range(5)]
-        print(f"  Sample indices: {sample_indices}")
-
-    # --- Block 6b-4, 6b-5: Compute Q values and loss ---
-    D = config.D
-    gamma = config.gamma
-    discount = torch.tensor([gamma ** t for t in range(D)], device=device)
-
-    total_loss = 0.0
-    q_values_list = []
-    correct_predictions = 0
-    total_predictions = 0
-
     # Convert expert actions to one-hot: [batch, seq_len] -> [batch, seq_len, action_size]
-    expert_action_one_hot = F.one_hot(expert_action_idx, num_classes=action_size).float()
+    expert_action_one_hot = F.one_hot(expert_action_idx, num_classes=config.action_size).float()
+    state_action = torch.cat([states, expert_action_one_hot], dim=-1)
 
-    # Expand for all action choices at current timestep
-    # states_expanded: [batch, seq_len, action_size, state_size]
-    states_expanded = states.unsqueeze(2).expand(-1, -1, action_size, -1)
-    # expert_action_expanded: [batch, seq_len, action_size, action_size]
-    expert_action_expanded = expert_action_one_hot.unsqueeze(2).expand(-1, -1, action_size, -1)
+    # input to model: [batch, seq_len, state_size + action_size]
+    # output from model: [batch, seq_len, 1] -> squeeze to [batch, seq_len]
+    rewards_pred = model(state_action).squeeze(-1)
 
-    # Eye matrix for replacing at timestep ct (create once outside loop)
-    # action_eye: [batch, action_size, action_size]
-    action_eye = torch.eye(action_size, device=device).unsqueeze(0).expand(batch_size, -1, -1)
+    # sum rewards across trajectory for each sample: [batch]
+    trajectory_rewards = rewards_pred.sum(dim=1)
 
-    for ct in range(seq_len - D):
+    # Max-ent loss: -log(softmax(trajectory_rewards / temperature))
+    scaled_rewards = trajectory_rewards / config.temperature
+    log_probs = torch.log_softmax(scaled_rewards, dim=0)
+    loss = -log_probs.sum()
 
-        # --- Block 6b-1: Replace expert action at ct with all possible actions ---
-        cur_action_expanded = expert_action_expanded.clone()
-        cur_action_expanded[:, ct, :, :] = action_eye
-        state_action = torch.cat([states_expanded, cur_action_expanded], dim=-1)
-
-        # --- Block 6b-2: Reshape and forward through U-Net ---
-        state_action_flat = state_action.permute(0, 2, 1, 3).reshape(
-            batch_size * action_size, seq_len, state_size + action_size
-        )
-        rewards_pred = model(state_action_flat)
-        rewards_pred = rewards_pred.reshape(batch_size, action_size, seq_len, 1)
-        rewards_pred = rewards_pred.squeeze(-1).permute(0, 2, 1)
-
-        future_rewards = rewards_pred[:, ct:ct+D, :]
-        Q_values = (future_rewards * discount.unsqueeze(0).unsqueeze(-1)).sum(dim=1)
-        Q_logits = F.softmax(Q_values, dim=1)
-        q_values_list.append(Q_values.mean().item())
-
-        expert_idx_ct = expert_action_idx[:, ct]
-        loss_ct = F.cross_entropy(Q_logits, expert_idx_ct, reduction='sum')
-        total_loss += loss_ct
-
-        predicted_action = Q_logits.argmax(dim=-1)
-        correct_predictions += (predicted_action == expert_idx_ct).sum().item()
-        total_predictions += batch_size
-
-    # --- Block 6b-6: Normalize loss ---
-    T = seq_len - D
-    loss = total_loss / (T * batch_size)
+    probs = log_probs.exp()
+    uniform = 1.0 / batch_size
 
     metrics = {
-        'avg_q': np.mean(q_values_list),
-        'accuracy': correct_predictions / total_predictions if total_predictions > 0 else 0.0
+        'avg_q': trajectory_rewards.mean().item(),
+        'accuracy': probs.mean().item(),
+        'avg_log_prob': log_probs.mean().item(),
+        'max_prob': probs.max().item(),
+        'uniform_prob': uniform
     }
 
     return loss, metrics
@@ -454,7 +407,7 @@ def train(config: Config, data_pipeline):
         print(f"[DEBUG] Epoch {epoch+1}/{config.num_epochs} starting...")
         model.train()
         epoch_loss = 0.0
-        epoch_acc = 0.0
+        epoch_prob = 0.0
         num_batches = 0
 
         for batch_idx in range(n_batches):
@@ -479,7 +432,7 @@ def train(config: Config, data_pipeline):
             print(f"[DEBUG] Backward and step done") if batch_idx == 0 else None
 
             epoch_loss += loss.item()
-            epoch_acc += metrics['accuracy']
+            epoch_prob += metrics['accuracy']
             num_batches += 1
             step += 1
 
@@ -487,7 +440,7 @@ def train(config: Config, data_pipeline):
             if step % config.num_steps_per_eval_print == 0:
                 val_metrics = evaluate_validation(model, val_buffer, config, device)
                 print(f"Step {step} | Train Loss: {epoch_loss/num_batches:.4f} | "
-                      f"Train Acc: {epoch_acc/num_batches:.4f} | "
+                      f"Train AvgProb: {epoch_prob/num_batches:.4f} | "
                       f"Val Acc: {val_metrics['val_accuracy']:.4f}")
                 print(f"  Q_expert@T{config.eval_q_t_step1}: {val_metrics['val_q_expert_t1']:.4f} | "
                       f"Q_expert@T{config.eval_q_t_step2}: {val_metrics['val_q_expert_t2']:.4f} | "
@@ -525,6 +478,7 @@ def save_model(model: UNetRewardGenerator, config: Config, filepath: str):
         'config': {
             'D': config.D,
             'gamma': config.gamma,
+            'temperature': config.temperature,
             'vp1_bins': config.vp1_bins,
             'vp2_bins': config.vp2_bins,
             'sequence_length': config.sequence_length
@@ -575,6 +529,7 @@ def main():
     parser.add_argument('--conv_h_dim', type=int, default=128, help='Conv hidden dimension')
     parser.add_argument('--D', type=int, default=10, help='Q-value horizon')
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Max-ent trajectory temperature')
     parser.add_argument('--vp1_bins', type=int, default=2, help='VP1 bins')
     parser.add_argument('--vp2_bins', type=int, default=5, help='VP2 bins')
     parser.add_argument('--experiment_dir', type=str, default='experiments/unet_reward_gen',
@@ -589,6 +544,7 @@ def main():
         conv_h_dim=args.conv_h_dim,
         D=args.D,
         gamma=args.gamma,
+        temperature=args.temperature,
         vp1_bins=args.vp1_bins,
         vp2_bins=args.vp2_bins,
         experiment_dir=args.experiment_dir+'_'+str(args.conv_h_dim),
@@ -596,7 +552,7 @@ def main():
 
     print(f"Config: epochs={config.num_epochs}, batch_size={config.batch_size}, "
           f"lr={config.learning_rate}, conv_h_dim={config.conv_h_dim}, "
-          f"D={config.D}, gamma={config.gamma}, "
+          f"D={config.D}, gamma={config.gamma}, temperature={config.temperature}, "
           f"vp1_bins={config.vp1_bins}, vp2_bins={config.vp2_bins}, action_size={config.action_size}")
 
     # Initialize data pipeline (use manual rewards - we generate our own via U-Net)
