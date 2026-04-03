@@ -562,7 +562,7 @@ def main():
     parser.add_argument('--d_model', type=int, default=64, help='Transformer hidden dimension')
     parser.add_argument('--nhead', type=int, default=2, help='Number of attention heads')
     parser.add_argument('--num_layers', type=int, default=2, help='Number of transformer layers')
-    parser.add_argument('--d_ff', type=int, default=512, help='Transformer feedforward dimension')
+    parser.add_argument('--d_ff', type=int, default=64, help='Transformer feedforward dimension')
     parser.add_argument('--dropout', type=float, default=0.1, help='Transformer dropout')
     parser.add_argument('--D', type=int, default=10, help='Q-value horizon')
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
