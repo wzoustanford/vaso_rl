@@ -770,3 +770,110 @@ print(f"\nPer-trajectory WIS evaluation with 95% CI:")
 print(f"  Clinician policy (raw):        {clinician_per_trajectory_mean:.4f}")
 print(f"  Model policy (WIS):            {wis_trajectory_level:.4f}")
 print(f"  Difference (Model - Clinician): {improvement_mean:.4f} (95% CI: [{ci_diff_lower:.4f}, {ci_diff_upper:.4f}])")
+
+# =============================================================================
+# IMPORTANCE SAMPLING DIAGNOSTICS
+# (i)   Effective Sample Size (ESS) as fraction of total N
+# (ii)  Histograms of normalized importance weight distributions
+# (iii) Maximum weight ratio  max_j w_j / sum_j w_j
+# References: Thomas et al. (2015); Precup et al. (2000)
+# =============================================================================
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+# Extract model name from checkpoint path for output file naming
+model_name = os.path.splitext(os.path.basename(model_path))[0]
+
+print("\n" + "="*70)
+print(f"IMPORTANCE SAMPLING DIAGNOSTICS (model: {model_name})")
+print("="*70)
+
+# --- (i) Effective Sample Size ---
+# Kish's ESS = (sum w_i)^2 / sum(w_i^2)
+ess_transition = is_weight.sum()**2 / (is_weight**2).sum()
+ess_transition_frac = ess_transition / len(is_weight)
+
+ess_trajectory = weights_per_trajectory_list.sum()**2 / (weights_per_trajectory_list**2).sum()
+ess_trajectory_frac = ess_trajectory / len(weights_per_trajectory_list)
+
+print(f"\n(i) Effective Sample Size (ESS):")
+print(f"  Per-transition level:")
+print(f"    ESS:            {ess_transition:.2f}")
+print(f"    Total N:        {len(is_weight)}")
+print(f"    ESS / N:        {ess_transition_frac:.4f} ({ess_transition_frac*100:.2f}%)")
+print(f"  Per-trajectory level:")
+print(f"    ESS:            {ess_trajectory:.2f}")
+print(f"    Total N:        {len(weights_per_trajectory_list)}")
+print(f"    ESS / N:        {ess_trajectory_frac:.4f} ({ess_trajectory_frac*100:.2f}%)")
+
+# --- (iii) Maximum Weight Ratio ---
+max_weight_ratio_transition = is_weight.max() / is_weight.sum()
+max_weight_ratio_trajectory = weights_per_trajectory_list.max() / weights_per_trajectory_list.sum()
+
+print(f"\n(iii) Maximum Weight Ratio (single-sample dominance):")
+print(f"  Per-transition:   max(w)/sum(w) = {max_weight_ratio_transition:.6f} ({max_weight_ratio_transition*100:.4f}%)")
+print(f"  Per-trajectory:   max(w)/sum(w) = {max_weight_ratio_trajectory:.6f} ({max_weight_ratio_trajectory*100:.4f}%)")
+
+# --- (ii) Histograms of Normalized Importance Weight Distributions ---
+norm_weights_transition = is_weight / is_weight.sum()
+norm_weights_trajectory = weights_per_trajectory_list / weights_per_trajectory_list.sum()
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+axes[0].hist(norm_weights_transition, bins=50, edgecolor='black', alpha=0.7)
+axes[0].axvline(1.0 / len(norm_weights_transition), color='red', linestyle='--',
+                label=f'Uniform = {1.0/len(norm_weights_transition):.2e}')
+axes[0].set_xlabel('Normalized IS Weight')
+axes[0].set_ylabel('Count')
+axes[0].set_title(f'Per-Transition Normalized Weights\n'
+                  f'ESS/N={ess_transition_frac:.4f}, '
+                  f'max(w)/sum(w)={max_weight_ratio_transition:.4e}')
+axes[0].legend()
+axes[0].set_yscale('log')
+
+axes[1].hist(norm_weights_trajectory, bins=50, edgecolor='black', alpha=0.7, color='orange')
+axes[1].axvline(1.0 / len(norm_weights_trajectory), color='red', linestyle='--',
+                label=f'Uniform = {1.0/len(norm_weights_trajectory):.2e}')
+axes[1].set_xlabel('Normalized IS Weight')
+axes[1].set_ylabel('Count')
+axes[1].set_title(f'Per-Trajectory Normalized Weights\n'
+                  f'ESS/N={ess_trajectory_frac:.4f}, '
+                  f'max(w)/sum(w)={max_weight_ratio_trajectory:.4e}')
+axes[1].legend()
+axes[1].set_yscale('log')
+
+plt.tight_layout()
+hist_path = f'latex/is_weight_histograms_{model_name}.png'
+plt.savefig(hist_path, dpi=150, bbox_inches='tight')
+plt.close()
+print(f"\n(ii) Weight distribution histograms saved to: {hist_path}")
+
+# --- Summary diagnostics table (LaTeX) ---
+diagnostics_latex = r"""\begin{table}[h]
+\centering
+\caption{Importance Sampling Diagnostics (%s)}
+\label{tab:is_diagnostics_%s}
+\begin{tabular}{lcc}
+\hline
+\textbf{Diagnostic} & \textbf{Per-Transition} & \textbf{Per-Trajectory} \\
+\hline
+Effective Sample Size (ESS) & %.2f & %.2f \\
+Total $N$ & %d & %d \\
+ESS / $N$ & %.4f & %.4f \\
+Max weight ratio $\max_j w_j / \sum_j w_j$ & %.6f & %.6f \\
+\hline
+\end{tabular}
+\end{table}
+""" % (
+    model_name.replace('_', r'\_'), model_name,
+    ess_transition, ess_trajectory,
+    len(is_weight), len(weights_per_trajectory_list),
+    ess_transition_frac, ess_trajectory_frac,
+    max_weight_ratio_transition, max_weight_ratio_trajectory
+)
+
+diagnostics_latex_file = f'latex/is_diagnostics_{model_name}.tex'
+with open(diagnostics_latex_file, 'w') as f:
+    f.write(diagnostics_latex)
+print(f"Diagnostics LaTeX table saved to: {diagnostics_latex_file}")
