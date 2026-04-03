@@ -347,6 +347,100 @@ class IntegratedDataPipelineV3:
         print(f"  vp1_bins: {vp1_bins}, vp2_bins: {vp2_bins}")
         print(f"  Reward = per-timestep output from U-Net")
 
+    def load_unet_maxent_reward_model(self, checkpoint_path: str, vp1_bins: int = 2, vp2_bins: int = 5):
+        """
+        Load U-Net model for reward computation.
+        U-Net outputs per-timestep rewards for each trajectory.
+
+        Args:
+            checkpoint_path: Path to U-Net checkpoint (.pt file)
+            vp1_bins: Number of VP1 bins (default 2 for binary)
+            vp2_bins: Number of VP2 bins (default 5)
+
+        Note: vp1_bins and vp2_bins should match the model's action_size.
+        TODO: Future improvement - read these from the model checkpoint directly.
+        """
+        from unet_reward_generator_tanh_maxent import UNetRewardGenerator
+
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        # Get model parameters from checkpoint
+        state_size = checkpoint.get('state_size')
+        action_size = checkpoint.get('action_size', vp1_bins * vp2_bins)
+        conv_h_dim = checkpoint.get('conv_h_dim', 64)
+
+        # Fallback: infer from model weights if not found
+        if state_size is None:
+            input_size = checkpoint['model_state_dict']['enc1.0.weight'].shape[1]
+            state_size = input_size - action_size
+
+        # Store U-Net specific parameters
+        self.unet_vp1_bins = vp1_bins
+        self.unet_vp2_bins = vp2_bins
+        self.unet_n_actions = vp1_bins * vp2_bins
+
+        # Initialize and load model
+        self.reward_model = UNetRewardGenerator(
+            state_size=state_size,
+            action_size=action_size,
+            conv_h_dim=conv_h_dim
+        ).to(self.device)
+        self.reward_model.load_state_dict(checkpoint['model_state_dict'])
+        self.reward_model_type = 'unet_maxent'
+        self.reward_model.eval()
+        
+        print(f"Loaded U-Net reward model from: {checkpoint_path}")
+        print(f"  state_size: {state_size}, action_size: {action_size}, conv_h_dim: {conv_h_dim}")
+        print(f"  vp1_bins: {vp1_bins}, vp2_bins: {vp2_bins}")
+        print(f"  Reward = per-timestep output from U-Net")
+
+    def load_transformer_context_irl_reward_model(self, checkpoint_path: str, vp1_bins: int = 2, vp2_bins: int = 5):
+        """
+        Load U-Net model for reward computation.
+        U-Net outputs per-timestep rewards for each trajectory.
+
+        Args:
+            checkpoint_path: Path to U-Net checkpoint (.pt file)
+            vp1_bins: Number of VP1 bins (default 2 for binary)
+            vp2_bins: Number of VP2 bins (default 5)
+
+        Note: vp1_bins and vp2_bins should match the model's action_size.
+        TODO: Future improvement - read these from the model checkpoint directly.
+        """
+        from transformer_reward_generator_tanh import TransformerCIRLRewardGenerator
+
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        # Get model parameters from checkpoint
+        state_size = checkpoint.get('state_size')
+        action_size = checkpoint.get('action_size', vp1_bins * vp2_bins)
+        d_model = checkpoint.get('d_model', 64)
+
+        # Fallback: infer from model weights if not found
+        if state_size is None:
+            input_size = checkpoint['model_state_dict']['enc1.0.weight'].shape[1]
+            state_size = input_size - action_size
+
+        # Store U-Net specific parameters
+        self.unet_vp1_bins = vp1_bins
+        self.unet_vp2_bins = vp2_bins
+        self.unet_n_actions = vp1_bins * vp2_bins
+
+        # Initialize and load model
+        self.reward_model = TransformerCIRLRewardGenerator(
+            state_size=state_size,
+            action_size=action_size,
+            conv_h_dim=d_model
+        ).to(self.device)
+        self.reward_model.load_state_dict(checkpoint['model_state_dict'])
+        self.reward_model_type = 'transformer_context_irl'
+        self.reward_model.eval()
+
+        print(f"Loaded U-Net reward model from: {checkpoint_path}")
+        print(f"  state_size: {state_size}, action_size: {action_size}, conv_h_dim: {d_model}")
+        print(f"  vp1_bins: {vp1_bins}, vp2_bins: {vp2_bins}")
+        print(f"  Reward = per-timestep output from U-Net")
+
     def load_semi_supervised_unet_reward_model(self, checkpoint_path: str, vp1_bins: int = 2, vp2_bins: int = 5):
         """
         Load Semi-Supervised U-Net model for reward computation.

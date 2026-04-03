@@ -370,7 +370,7 @@ def train_block_discrete_cql(
             combined_or_train_data_path=combined_or_train_data_path,
             eval_data_path=eval_data_path
         )
-    elif 'gcl' in reward_model_path:
+    elif reward_model_path.split('/')[-1].startswith('gcl'):
         reward_type = "gcl"
         pipeline = IntegratedDataPipelineV3(
             model_type='dual', reward_source='learned', random_seed=42,
@@ -379,7 +379,7 @@ def train_block_discrete_cql(
             eval_data_path=eval_data_path
         )
         pipeline.load_gcl_reward_model(reward_model_path)
-    elif 'iq_learn' in reward_model_path:
+    elif reward_model_path.split('/')[-1].startswith('iq_learn'):
         reward_type = "iq_learn"
         pipeline = IntegratedDataPipelineV3(
             model_type='dual', reward_source='learned', random_seed=42,
@@ -388,7 +388,7 @@ def train_block_discrete_cql(
             eval_data_path=eval_data_path
         )
         pipeline.load_iq_learn_reward_model(reward_model_path)
-    elif 'maxent' in reward_model_path:
+    elif reward_model_path.split('/')[-1].startswith('maxent'):
         reward_type = "maxent"
         pipeline = IntegratedDataPipelineV3(
             model_type='dual', reward_source='learned', random_seed=42,
@@ -410,7 +410,7 @@ def train_block_discrete_cql(
         # Use irl_vp2_bins for loading (IRL model's action space), not vp2_bins (Q-learning action space)
         pipeline.load_semi_supervised_unet_reward_model(reward_model_path, vp1_bins=2, vp2_bins=irl_vp2_bins)
         print(f"  IRL model vp2_bins: {irl_vp2_bins}, Q-learning vp2_bins: {vp2_bins}")
-    elif 'unet' in reward_model_path:
+    elif reward_model_path.split('/')[-1].startswith('unet'):
         # U-Net provides learned rewards via per-trajectory inference
         reward_type = "unet"
         pipeline = IntegratedDataPipelineV3(
@@ -422,6 +422,32 @@ def train_block_discrete_cql(
         # Load U-Net model - use irl_vp2_bins for the IRL model's action space
         # This allows the IRL model to have different discretization than Q-learning
         pipeline.load_unet_reward_model(reward_model_path, vp1_bins=2, vp2_bins=irl_vp2_bins)
+        print(f"  IRL model vp2_bins: {irl_vp2_bins}, Q-learning vp2_bins: {vp2_bins}")
+    elif 'maxent' in reward_model_path and 'unet' in reward_model_path: 
+        # U-Net provides learned rewards via per-trajectory inference
+        reward_type = "unet_maxent"
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
+        )
+        # Load U-Net model - use irl_vp2_bins for the IRL model's action space
+        # This allows the IRL model to have different discretization than Q-learning
+        pipeline.load_unet_max_ent_reward_model(reward_model_path, vp1_bins=2, vp2_bins=irl_vp2_bins)
+        print(f"  IRL model vp2_bins: {irl_vp2_bins}, Q-learning vp2_bins: {vp2_bins}")
+    elif reward_model_path.split('/')[-1].startswith('transformer'):
+        # U-Net provides learned rewards via per-trajectory inference
+        reward_type = "transformer_context_irl"
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
+        )
+        # Load U-Net model - use irl_vp2_bins for the IRL model's action space
+        # This allows the IRL model to have different discretization than Q-learning
+        pipeline.load_transformer_context_irl_reward_model(reward_model_path, vp1_bins=2, vp2_bins=irl_vp2_bins)
         print(f"  IRL model vp2_bins: {irl_vp2_bins}, Q-learning vp2_bins: {vp2_bins}")
     else:
         raise ValueError(f"Cannot infer reward model type from path: {reward_model_path}")
