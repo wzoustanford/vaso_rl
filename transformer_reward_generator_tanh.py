@@ -7,6 +7,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 import os
 import json
+import re
 from datetime import datetime
 
 # Local imports
@@ -45,11 +46,11 @@ class Config:
     eval_q_t_step2: int = 20      # Second timestep to evaluate Q
 
     # Sequence buffer
-    sequence_length: int = 40     # Will be set based on data
+    sequence_length: int = 512     # Will be set based on data
     overlap: int = 1              # As specified in prompts
 
     # Paths
-    experiment_dir: str = "experiments/unet_reward_gen_fixed_32"
+    experiment_dir: str = "experiments/transformer_reward_gen"
 
     def __init__(self, **kwargs):
         for key, value in kwargs.items():
@@ -59,8 +60,7 @@ class Config:
         self.action_size = self.vp1_bins * self.vp2_bins
 
 ## Transformer Architecture
-# keep the class name for consistency
-class UNetRewardGenerator(nn.Module):
+class TransformerRewardGenerator(nn.Module):
     """
     Transformer reward model that takes trajectories and outputs per-timestep rewards.
 
@@ -96,6 +96,15 @@ class UNetRewardGenerator(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # Transformer Encoder
+        # nn.TransformerEncoderLayer with batch_first=True expects:
+        # input:  [batch, seq_len, d_model]
+        # output: [batch, seq_len, d_model]
+        #
+        # Model inputs:
+        # input_projection: [batch, seq_len, state_size + action_size] -> [batch, seq_len, d_model]
+        # position_embedding is added with shape [1, seq_len, d_model]
+        # dropout preserves shape: [batch, seq_len, d_model]
+        # therefore, input to transformer is [batch, seq_len, d_model]
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -142,6 +151,8 @@ class UNetRewardGenerator(nn.Module):
 
         # No mask
         x = self.transformer(x)
+
+        # Output dimension: [batch, seq_len, d_model] -> [batch, seq_len, 1]
         x = self.ln_f(x)
         return self.output_layer(x)
 
@@ -198,7 +209,7 @@ def load_trajectories(data_pipeline, config: Config) -> tuple:
 
 
 def compute_training_step(
-    model: UNetRewardGenerator,
+    model: TransformerRewardGenerator,
     states: torch.Tensor,
     actions: torch.Tensor,
     config: Config,
@@ -208,7 +219,7 @@ def compute_training_step(
     Compute loss for one batch of sequences.
 
     Args:
-        model: UNetRewardGenerator
+        model: TransformerRewardGenerator
         states: [batch, seq_len, state_size]
         actions: [batch, seq_len, 2] - expert actions (vp1, vp2) continuous
         config: Configuration
@@ -292,7 +303,7 @@ def compute_training_step(
 
 
 def evaluate_validation(
-    model: UNetRewardGenerator,
+    model: TransformerRewardGenerator,
     val_buffer,
     config: Config,
     device: torch.device
@@ -384,7 +395,7 @@ def evaluate_validation(
     }
 
 
-def train(config: Config, data_pipeline):
+def train(config: Config, data_pipeline, resume_model_path: str = None):
     """
     Main training loop for transformer reward generator.
     """
@@ -401,19 +412,45 @@ def train(config: Config, data_pipeline):
     # Create validation buffer (using same pipeline but could be separate)
     val_buffer = buffer  # TODO: Create separate val buffer if needed
 
+    start_epoch = 0
+
     # Initialize model
-    print(f"[DEBUG] Initializing transformer reward generator with state_size={state_size}, action_size={config.action_size}")
-    model = UNetRewardGenerator(
-        state_size=state_size,
-        action_size=config.action_size,
-        d_model=config.d_model,
-        nhead=config.nhead,
-        num_layers=config.num_layers,
-        d_ff=config.d_ff,
-        dropout=config.dropout,
-        max_seq_length=config.sequence_length,
-    ).to(device)
-    print("[DEBUG] Model initialized")
+    if resume_model_path:
+        print(f"[DEBUG] Resuming transformer reward generator from {resume_model_path}")
+        model, checkpoint_config = load_model(resume_model_path, device=device)
+
+        if model.action_size != config.action_size:
+            raise ValueError(
+                f"Checkpoint action_size={model.action_size} does not match requested "
+                f"action_size={config.action_size}"
+            )
+        if model.d_model != config.d_model or model.num_layers != config.num_layers:
+            raise ValueError(
+                "Checkpoint architecture does not match requested transformer settings. "
+                f"checkpoint=(d_model={model.d_model}, num_layers={model.num_layers}) "
+                f"requested=(d_model={config.d_model}, num_layers={config.num_layers})"
+            )
+
+        config.sequence_length = checkpoint_config.get('sequence_length', config.sequence_length)
+        model.max_seq_length = checkpoint_config.get('sequence_length', model.max_seq_length)
+
+        match = re.search(r'model_epoch_(\d+)\.pt$', os.path.basename(resume_model_path))
+        if match:
+            start_epoch = int(match.group(1))
+        print(f"[DEBUG] Resume start_epoch={start_epoch}, max_seq_length={model.max_seq_length}")
+    else:
+        print(f"[DEBUG] Initializing transformer reward generator with state_size={state_size}, action_size={config.action_size}")
+        model = TransformerRewardGenerator(
+            state_size=state_size,
+            action_size=config.action_size,
+            d_model=config.d_model,
+            nhead=config.nhead,
+            num_layers=config.num_layers,
+            d_ff=config.d_ff,
+            dropout=config.dropout,
+            max_seq_length=config.sequence_length,
+        ).to(device)
+        print("[DEBUG] Model initialized")
 
     optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
     print("[DEBUG] Optimizer created")
@@ -423,7 +460,8 @@ def train(config: Config, data_pipeline):
     print(f"[DEBUG] Starting training: {config.num_epochs} epochs, {n_batches} batches per epoch")
 
     for epoch in range(config.num_epochs):
-        print(f"[DEBUG] Epoch {epoch+1}/{config.num_epochs} starting...")
+        absolute_epoch = start_epoch + epoch + 1
+        print(f"[DEBUG] Epoch {absolute_epoch} ({epoch+1}/{config.num_epochs} resumed-run) starting...")
         model.train()
         epoch_loss = 0.0
         epoch_acc = 0.0
@@ -431,7 +469,7 @@ def train(config: Config, data_pipeline):
 
         for batch_idx in range(n_batches):
             if batch_idx % 10 == 0:
-                print(f"[DEBUG] Epoch {epoch+1}, Batch {batch_idx}/{n_batches}...")
+                print(f"[DEBUG] Epoch {absolute_epoch}, Batch {batch_idx}/{n_batches}...")
 
             print(f"[DEBUG] Sampling sequences...") if batch_idx == 0 else None
             burn_in, training, indices, weights = buffer.sample_sequences(config.batch_size)
@@ -468,10 +506,10 @@ def train(config: Config, data_pipeline):
                 model.train()  # Back to train mode
 
         # End of epoch
-        print(f"Epoch {epoch+1}/{config.num_epochs} complete")
+        print(f"Epoch {absolute_epoch} complete")
 
         # Save model each epoch
-        save_path = os.path.join(config.experiment_dir, f"model_epoch_{epoch+1}.pt")
+        save_path = os.path.join(config.experiment_dir, f"model_epoch_{absolute_epoch}.pt")
         save_model(model, config, save_path)
 
     print("Training complete!")
@@ -480,12 +518,12 @@ def train(config: Config, data_pipeline):
 
 ## Model saving and loading functions
 
-def save_model(model: UNetRewardGenerator, config: Config, filepath: str):
+def save_model(model: TransformerRewardGenerator, config: Config, filepath: str):
     """
     Save model checkpoint.
 
     Args:
-        model: UNetRewardGenerator model
+        model: TransformerRewardGenerator model
         config: Configuration object
         filepath: Path to save the model
     """
@@ -531,7 +569,7 @@ def load_model(filepath: str, device: torch.device = None) -> tuple:
 
     checkpoint = torch.load(filepath, map_location=device)
 
-    model = UNetRewardGenerator(
+    model = TransformerRewardGenerator(
         state_size=checkpoint['state_size'],
         action_size=checkpoint['action_size'],
         d_model=checkpoint['d_model'],
@@ -570,6 +608,8 @@ def main():
     parser.add_argument('--vp2_bins', type=int, default=5, help='VP2 bins')
     parser.add_argument('--experiment_dir', type=str, default='experiments/transformer_reward_gen',
                        help='Directory to save models')
+    parser.add_argument('--resume_model_path', type=str, default=None,
+                       help='Path to a saved transformer checkpoint to continue training from')
     parser.add_argument('--combined_or_train_data_path', type=str, default=None,
                        help='Path to training dataset. If eval_data_path is also provided, '
                             'all patients from this dataset are used for training.')
@@ -619,7 +659,7 @@ def main():
     )
 
     # Train model
-    model = train(config, pipeline)
+    model = train(config, pipeline, resume_model_path=args.resume_model_path)
 
     print("Done!")
 

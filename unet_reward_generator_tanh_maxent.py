@@ -45,6 +45,8 @@ class Config:
     sequence_length: int = 40     # Will be set based on data
     overlap: int = 1              # As specified in prompts
 
+    temperature: float = 0.9       # Temperature for max-ent loss
+
     # Paths
     experiment_dir: str = "experiments/unet_reward_gen_fixed_32"
 

@@ -340,7 +340,7 @@ def train_block_discrete_cql(
         alpha: CQL penalty strength
         vp2_bins: Number of bins for VP2 discretization (for Q-learning action space)
         epochs: Number of training epochs
-        reward_model_path: Path to learned reward model (gcl/iq_learn/maxent/unet)
+        reward_model_path: Path to learned reward model (gcl/iq_learn/maxent/unet/transformer)
         suffix: Suffix to add to experiment prefix
         save_dir: Directory to save models
         reward_combine_lambda: If None, use pure IRL reward. If in [0, 1], use
@@ -409,6 +409,17 @@ def train_block_discrete_cql(
         # Load Semi-supervised U-Net model (uses only UNetRewardGenerator, not MortalityDiffuser)
         # Use irl_vp2_bins for loading (IRL model's action space), not vp2_bins (Q-learning action space)
         pipeline.load_semi_supervised_unet_reward_model(reward_model_path, vp1_bins=2, vp2_bins=irl_vp2_bins)
+        print(f"  IRL model vp2_bins: {irl_vp2_bins}, Q-learning vp2_bins: {vp2_bins}")
+    elif 'transformer' in reward_model_path:
+        # Transformer reward model provides learned rewards via per-trajectory inference
+        reward_type = "transformer"
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
+        )
+        pipeline.load_trans_reward_model(reward_model_path, vp1_bins=2, vp2_bins=irl_vp2_bins)
         print(f"  IRL model vp2_bins: {irl_vp2_bins}, Q-learning vp2_bins: {vp2_bins}")
     elif 'unet' in reward_model_path:
         # U-Net provides learned rewards via per-trajectory inference
@@ -581,7 +592,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=100,
                        help='Number of training epochs (default: 100)')
     parser.add_argument('--reward_model_path', type=str, default=None,
-                       help='Path to learned reward model (gcl/iq_learn/maxent). None=manual reward')
+                       help='Path to learned reward model (gcl/iq_learn/maxent/unet/transformer). None=manual reward')
     parser.add_argument('--suffix', type=str, default='',
                        help='Suffix to add to experiment prefix (e.g., "_irl100")')
     parser.add_argument('--save_dir', type=str, default='experiment/ql',

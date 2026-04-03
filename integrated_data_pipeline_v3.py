@@ -211,7 +211,7 @@ class IntegratedDataPipelineV3:
 
         # Learned reward model (loaded separately)
         self.reward_model = None
-        self.reward_model_type = None  # 'gcl', 'iq_learn', 'maxent', or 'unet'
+        self.reward_model_type = None  # 'gcl', 'iq_learn', 'maxent', 'unet', or 'transformer'
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # U-Net specific parameters (set when loading U-Net model)
@@ -338,14 +338,62 @@ class IntegratedDataPipelineV3:
             action_size=action_size,
             conv_h_dim=conv_h_dim
         ).to(self.device)
-        self.reward_model.load_state_dict(checkpoint['model_state_dict'])
         self.reward_model_type = 'unet'
+
+        self.reward_model.load_state_dict(checkpoint['model_state_dict'])
         self.reward_model.eval()
 
         print(f"Loaded U-Net reward model from: {checkpoint_path}")
         print(f"  state_size: {state_size}, action_size: {action_size}, conv_h_dim: {conv_h_dim}")
         print(f"  vp1_bins: {vp1_bins}, vp2_bins: {vp2_bins}")
         print(f"  Reward = per-timestep output from U-Net")
+
+    def load_trans_reward_model(self, checkpoint_path: str, vp1_bins: int = 2, vp2_bins: int = 5):
+        """
+        Load transformer reward model for reward computation.
+        Transformer outputs per-timestep rewards for each trajectory.
+
+        Args:
+            checkpoint_path: Path to transformer checkpoint (.pt file)
+            vp1_bins: Number of VP1 bins (default 2 for binary)
+            vp2_bins: Number of VP2 bins (default 5)
+        """
+        from transformer_reward_generator_tanh import TransformerRewardGenerator
+
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        state_size = checkpoint['state_size']
+        action_size = checkpoint.get('action_size', vp1_bins * vp2_bins)
+        d_model = checkpoint.get('d_model', 128)
+        nhead = checkpoint.get('nhead', 8)
+        num_layers = checkpoint.get('num_layers', 4)
+        d_ff = checkpoint.get('d_ff', 512)
+        dropout = checkpoint.get('dropout', 0.1)
+        max_seq_length = checkpoint.get('max_seq_length', 512)
+
+        self.unet_vp1_bins = vp1_bins
+        self.unet_vp2_bins = vp2_bins
+        self.unet_n_actions = vp1_bins * vp2_bins
+
+        self.reward_model = TransformerRewardGenerator(
+            state_size=state_size,
+            action_size=action_size,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            d_ff=d_ff,
+            dropout=dropout,
+            max_seq_length=max_seq_length
+        ).to(self.device)
+        self.reward_model.load_state_dict(checkpoint['model_state_dict'])
+        self.reward_model_type = 'transformer'
+        self.reward_model.eval()
+
+        print(f"Loaded transformer reward model from: {checkpoint_path}")
+        print(f"  state_size: {state_size}, action_size: {action_size}, d_model: {d_model}")
+        print(f"  nhead: {nhead}, num_layers: {num_layers}, d_ff: {d_ff}, dropout: {dropout}")
+        print(f"  vp1_bins: {vp1_bins}, vp2_bins: {vp2_bins}")
+        print(f"  Reward = per-timestep output from transformer")
 
     def load_semi_supervised_unet_reward_model(self, checkpoint_path: str, vp1_bins: int = 2, vp2_bins: int = 5):
         """
@@ -745,7 +793,7 @@ class IntegratedDataPipelineV3:
         Recompute rewards using the learned reward model on normalized states.
         Called after data processing when reward_source='learned'.
 
-        For U-Net: Process by trajectory since U-Net needs full sequences.
+        For U-Net/transformer: Process by trajectory since the reward model needs full sequences.
         For GCL/IQ-Learn/MaxEnt: Process in batches.
 
         If reward_combine_lambda is set, combines manual and IRL rewards:
@@ -768,10 +816,10 @@ class IntegratedDataPipelineV3:
 
             irl_rewards = np.zeros(n_transitions, dtype=np.float32)
 
-            if self.reward_model_type in ('unet', 'semi_supervised_unet'):
-                # U-Net: Process by trajectory (patient)
-                # U-Net requires full trajectory context for reward prediction
-                print(f"   {split_name}: Processing {len(patient_groups)} patients for U-Net rewards...")
+            if self.reward_model_type in ('unet', 'semi_supervised_unet', 'transformer'):
+                # Sequence reward models: process by trajectory (patient)
+                # These models require full trajectory context for reward prediction.
+                print(f"   {split_name}: Processing {len(patient_groups)} patients for sequence-model rewards...")
                 for i, (patient_id, (start_idx, end_idx)) in enumerate(patient_groups.items()):
                     if (i + 1) % 500 == 0:
                         print(f"     Processed {i+1}/{len(patient_groups)} patients")
