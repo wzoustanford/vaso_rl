@@ -332,7 +332,8 @@ def train_block_discrete_cql(
     reward_combine_lambda: float = None,
     combined_or_train_data_path: str = None,
     eval_data_path: str = None,
-    irl_vp2_bins: int = None
+    irl_vp2_bins: int = None,
+    time_one_batch: bool = False
 ):
     """Train Block Discrete CQL with specified alpha and optional learned reward
 
@@ -509,6 +510,15 @@ def train_block_discrete_cql(
             dones = torch.FloatTensor(batch['dones']).to(agent.device)
             
             # Update agent
+            if time_one_batch:
+                start = time.time()
+                metrics = agent.update(states, actions, rewards, next_states, dones)
+                end = time.time()
+                print(f"QL_BATCH_SHAPE={tuple(states.shape)}", flush=True)
+                print(f"QL_BATCH_TRANSITIONS={states.shape[0]}", flush=True)
+                print(f"QL_BATCH_TIME_SECONDS={end - start}", flush=True)
+                return agent, pipeline, experiment_prefix
+
             metrics = agent.update(states, actions, rewards, next_states, dones)
             
             # Accumulate metrics
@@ -611,6 +621,8 @@ def main():
                        help='Number of VP2 bins used to train the IRL model. If None, uses '
                             'the same value as --vp2_bins. This allows loading an IRL model '
                             'trained with different discretization than the Q-learning action space.')
+    parser.add_argument('--time_one_batch', action='store_true',
+                       help='Run one Q-learning training batch, print timing, and exit.')
     args = parser.parse_args()
 
     # Determine alpha values to use
@@ -661,7 +673,8 @@ def main():
             reward_combine_lambda=args.reward_combine_lambda,
             combined_or_train_data_path=args.combined_or_train_data_path,
             eval_data_path=args.eval_data_path,
-            irl_vp2_bins=irl_vp2_bins
+            irl_vp2_bins=irl_vp2_bins,
+            time_one_batch=args.time_one_batch
         )
         experiment_prefixes.append(exp_prefix)
 

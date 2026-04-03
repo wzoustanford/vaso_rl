@@ -16,8 +16,9 @@ QL_EPOCHS=50
 VP2_BINS=5
 TEST_MODE=false
 SUFFIX=""
+TIME_ONE_BATCH=false
 
-TRANS_BATCH_SIZE=64
+TRANS_BATCH_SIZE=128
 TRANS_D_MODEL=64
 TRANS_NHEAD=4
 TRANS_NUM_LAYERS=2
@@ -74,6 +75,10 @@ while [[ $# -gt 0 ]]; do
         --suffix)
             SUFFIX="$2"
             shift 2
+            ;;
+        --time_one_batch)
+            TIME_ONE_BATCH=true
+            shift
             ;;
         --d_model)
             TRANS_D_MODEL="$2"
@@ -190,6 +195,7 @@ echo "IRL Epochs: $TRANS_EPOCHS"
 echo "QL Epochs: $QL_EPOCHS"
 echo "VP2 Bins: $VP2_BINS"
 echo "Test Mode: $TEST_MODE"
+echo "Time One Batch: $TIME_ONE_BATCH"
 echo "Skip IRL: $SKIP_IRL"
 echo "Suffix: $SUFFIX"
 echo "Transformer batch_size: $TRANS_BATCH_SIZE"
@@ -296,13 +302,24 @@ else
     if [ -n "$RESUME_IRL_MODEL_PATH" ]; then
         TRANS_CMD="$TRANS_CMD --resume_model_path $RESUME_IRL_MODEL_PATH"
     fi
+    if [ "$TIME_ONE_BATCH" == "true" ]; then
+        TRANS_CMD="$TRANS_CMD --time_one_batch"
+    fi
 
     eval $TRANS_CMD
 
-    REWARD_MODEL_PATH=$(ls -t "${TRANS_DIR}_${TRANS_D_MODEL}d_${TRANS_NUM_LAYERS}l_tanh"/model_epoch_*.pt 2>/dev/null | head -1)
-    if [ -z "$REWARD_MODEL_PATH" ]; then
-        echo "Error: No transformer model found in ${TRANS_DIR}_${TRANS_D_MODEL}d_${TRANS_NUM_LAYERS}l_tanh"
-        exit 1
+    if [ "$TIME_ONE_BATCH" == "true" ]; then
+        REWARD_MODEL_PATH="${TRANS_DIR}_${TRANS_D_MODEL}d_${TRANS_NUM_LAYERS}l_tanh/timing_batch_model.pt"
+        if [ ! -f "$REWARD_MODEL_PATH" ]; then
+            echo "Error: Expected timing-mode transformer model not found: $REWARD_MODEL_PATH"
+            exit 1
+        fi
+    else
+        REWARD_MODEL_PATH=$(ls -t "${TRANS_DIR}_${TRANS_D_MODEL}d_${TRANS_NUM_LAYERS}l_tanh"/model_epoch_*.pt 2>/dev/null | head -1)
+        if [ -z "$REWARD_MODEL_PATH" ]; then
+            echo "Error: No transformer model found in ${TRANS_DIR}_${TRANS_D_MODEL}d_${TRANS_NUM_LAYERS}l_tanh"
+            exit 1
+        fi
     fi
 
     echo "IRL training complete. Model saved to: $REWARD_MODEL_PATH"
@@ -352,6 +369,9 @@ if [ "$USE_LSTM" == "true" ]; then
     if [ -n "$EVAL_DATA_PATH" ]; then
         QL_CMD="$QL_CMD --eval_data_path $EVAL_DATA_PATH"
     fi
+    if [ "$TIME_ONE_BATCH" == "true" ]; then
+        QL_CMD="$QL_CMD --time_one_batch"
+    fi
 
     mkdir -p "${EXPERIMENT_DIR}/logs"
     eval $QL_CMD
@@ -387,6 +407,9 @@ else
     if [ -n "$EVAL_DATA_PATH" ]; then
         QL_CMD="$QL_CMD --eval_data_path $EVAL_DATA_PATH"
     fi
+    if [ "$TIME_ONE_BATCH" == "true" ]; then
+        QL_CMD="$QL_CMD --time_one_batch"
+    fi
 
     eval $QL_CMD
 
@@ -398,8 +421,14 @@ else
     fi
 fi
 
-QL_MODEL_PATH="${QL_DIR}/${MODEL_PREFIX}_alpha0.0000_bins${VP2_BINS}_best.pt"
-echo "Q-Learning complete. Model saved to: $QL_MODEL_PATH"
+if [ "$TIME_ONE_BATCH" == "true" ]; then
+    QL_MODEL_PATH="N/A (time_one_batch mode)"
+    echo "Q-Learning one-batch timing complete."
+    exit 0
+else
+    QL_MODEL_PATH="${QL_DIR}/${MODEL_PREFIX}_alpha0.0000_bins${VP2_BINS}_best.pt"
+    echo "Q-Learning complete. Model saved to: $QL_MODEL_PATH"
+fi
 
 echo ""
 echo "=============================================="
