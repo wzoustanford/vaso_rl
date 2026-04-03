@@ -434,7 +434,7 @@ def train_block_discrete_cql(
         )
         # Load U-Net model - use irl_vp2_bins for the IRL model's action space
         # This allows the IRL model to have different discretization than Q-learning
-        pipeline.load_unet_max_ent_reward_model(reward_model_path, vp1_bins=2, vp2_bins=irl_vp2_bins)
+        pipeline.load_unet_maxent_reward_model(reward_model_path, vp1_bins=2, vp2_bins=irl_vp2_bins)
         print(f"  IRL model vp2_bins: {irl_vp2_bins}, Q-learning vp2_bins: {vp2_bins}")
     elif reward_model_path.split('/')[-1].startswith('transformer'):
         # U-Net provides learned rewards via per-trajectory inference
