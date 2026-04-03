@@ -583,7 +583,7 @@ if [ "$USE_LSTM" == "true" ]; then
 else
     # Build standard Q-Learning command
     QL_CMD="python ${SCRIPT_DIR}/run_block_discrete_cql_allalphas.py \
-	--suffix $SUFFIX \
+	    --suffix $SUFFIX \
         --single_alpha 0.0 \
         --vp2_bins $VP2_BINS \
         --epochs $QL_EPOCHS \
