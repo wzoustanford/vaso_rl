@@ -143,15 +143,15 @@ else:
 # Quick test mode: limit to 5 trajectories
 if quick_test:
     print("\n*** QUICK TEST MODE: limiting to 5 trajectories ***")
-    for dataset_name, dataset in [('train_data', train_data), ('eval_data', eval_data)]:
+    array_keys = ['states', 'actions', 'rewards', 'next_states', 'dones', 'patient_ids']
+    for dataset in [train_data, eval_data]:
         unique_pids = np.unique(dataset['patient_ids'])[:5]
         mask = np.isin(dataset['patient_ids'], unique_pids)
-        for key in dataset:
-            dataset[key] = dataset[key][mask]
-    if eval_set == 'val':
-        val_data = eval_data
-    else:
-        test_data = eval_data
+        for key in array_keys:
+            if key in dataset:
+                dataset[key] = dataset[key][mask]
+        dataset['n_transitions'] = int(mask.sum())
+        dataset['n_patients'] = len(unique_pids)
 
 # Print data statistics
 print(f"\nData splits:")
@@ -461,7 +461,7 @@ def get_full_proba(clf, X, n_classes):
 
 # Train softmax classifier for model actions (0 to n_actions-1)
 print(f"\n1. Training softmax classifier for model actions ({n_actions} classes)...")
-clf_model = LogisticRegression(multi_class='multinomial', solver='lbfgs', max_iter=1000, random_state=42)
+clf_model = LogisticRegression(solver='lbfgs', max_iter=1000, random_state=42)
 clf_model.fit(train_data['states'], train_model_actions_discrete)
 print(f"   Classifier learned classes: {sorted(clf_model.classes_)}")
 train_acc_model = accuracy_score(train_model_actions_discrete, clf_model.predict(train_data['states']))
@@ -471,7 +471,7 @@ print(f"   {eval_set_name} accuracy:  {eval_acc_model:.4f}")
 
 # Train softmax classifier for clinician actions (0 to n_actions-1)
 print(f"\n2. Training softmax classifier for clinician actions ({n_actions} classes)...")
-clf_clinician = LogisticRegression(multi_class='multinomial', solver='lbfgs', max_iter=1000, random_state=42)
+clf_clinician = LogisticRegression(solver='lbfgs', max_iter=1000, random_state=42)
 clf_clinician.fit(train_data['states'], train_clinician_actions_discrete)
 print(f"   Classifier learned classes: {sorted(clf_clinician.classes_)}")
 train_acc_clinician = accuracy_score(train_clinician_actions_discrete, clf_clinician.predict(train_data['states']))
