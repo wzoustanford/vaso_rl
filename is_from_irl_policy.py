@@ -486,11 +486,18 @@ eps = 1e-10
 # IS_weight = π_model(a_clinician|s) / π_clinician(a_clinician|s)
 is_weight = eval_prob_model / (eval_prob_clinician + eps)
 
-isw_ci_diff_lower = np.percentile(is_weight, 2.5)
-isw_ci_diff_upper = np.percentile(is_weight, 97.5)
+if use_is_clipping:
+    isw_ci_diff_lower = np.percentile(is_weight, args.is_clip_lower_pct)
+    isw_ci_diff_upper = np.percentile(is_weight, args.is_clip_upper_pct)
+    is_weight = np.clip(is_weight, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+    print(f"  IS clipping enabled with percentiles [{args.is_clip_lower_pct}, {args.is_clip_upper_pct}]")
+    print(f"  IS clipping bounds: [{isw_ci_diff_lower:.6f}, {isw_ci_diff_upper:.6f}]")
+else:
+    isw_ci_diff_lower = None
+    isw_ci_diff_upper = None
+    print("  IS clipping disabled")
 
-#is_weight = np.clip(is_weight, a_min = CLIP_MIN, a_max = CLIP_MAX)
-is_weight = np.clip(is_weight, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
+#is_weight = np.cumprod(is_weight)
 
 print(f"\nIS weight statistics:")
 print(f"  Mean: {is_weight.mean():.4f}, Std: {is_weight.std():.4f}, Min: {is_weight.min():.4f}, Max: {is_weight.max():.4f}")
@@ -501,7 +508,7 @@ eval_rewards = eval_data['rewards']
 # Compute IS-weighted rewards
 is_weighted_rewards = is_weight * eval_rewards
 
-print(f"\nReward statistics:")
+print(f"\nReward statistics ({reward_type}):")
 print(f"  Raw rewards (clinician)     - Mean: {eval_rewards.mean():.4f}, Std: {eval_rewards.std():.4f}, Sum: {eval_rewards.sum():.2f}")
 print(f"  IS-weighted rewards (model) - Mean: {is_weighted_rewards.mean():.4f}, Std: {is_weighted_rewards.std():.4f}, Sum: {is_weighted_rewards.sum():.2f}")
 
@@ -554,11 +561,10 @@ print(f"  IS (model):         Mean: {patient_is_rewards.mean():.4f}, Std: {patie
 os.makedirs('latex', exist_ok=True)
 
 # Save results to LaTeX table
-model_type_label = {'unet': 'U-Net Reward Generator', 'gcl': 'GCL', 'iqlearn': 'IQ-Learn'}
 latex_output = r"""\begin{table}[h]
 \centering
-\caption{Importance Sampling Off-Policy Evaluation Results (%s)}
-\label{tab:is_ope_results_%s}
+\caption{Importance Sampling Off-Policy Evaluation Results (Block Discrete CQL, $\alpha=0.0$)}
+\label{tab:is_ope_results}
 \begin{tabular}{lcc}
 \hline
 \textbf{Metric} & \textbf{Clinician Policy} & \textbf{Model Policy (IS)} \\
@@ -581,7 +587,6 @@ Per-Patient & \multicolumn{2}{c}{%.4f} \\
 \end{tabular}
 \end{table}
 """ % (
-    model_type_label.get(model_type, model_type), model_type,
     avg_raw_reward_per_transition, avg_is_reward_per_transition,
     avg_raw_reward_per_patient, avg_is_reward_per_patient,
     patient_raw_rewards.std(), patient_is_rewards.std(),
@@ -593,7 +598,7 @@ Per-Patient & \multicolumn{2}{c}{%.4f} \\
     avg_is_reward_per_patient - avg_raw_reward_per_patient
 )
 
-latex_file = f'latex/is_ope_results_{model_type}.tex'
+latex_file = 'latex/is_ope_results.tex'
 with open(latex_file, 'w') as f:
     f.write(latex_output)
 
@@ -646,6 +651,7 @@ print("="*70)
 # For each patient trajectory: WIS_τ = Σᵢ(wᵢ·rᵢ) / Σᵢ(wᵢ) for transitions in that trajectory
 # Then average across all patients
 
+# METHOD 1
 weights_per_trajectory_list = [] 
 total_rewards_per_trajectory_list = []
 weighted_rewards_per_trajectory_list = []
@@ -669,9 +675,15 @@ for patient_id in unique_patients:
     # Get weights and rewards for this trajectory
     patient_weights = is_weight[patient_mask]
     patient_rewards = eval_rewards[patient_mask]
+    weights_per_trajectory_list.append(patient_weights.mean())
+
+    patient_weights = np.cumprod(patient_weights)
+    if use_is_clipping:
+        patient_weights = np.clip(patient_weights, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+    
+    # np.clip(is_weight, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
     est_total_reward_per_traj = (patient_weights *  patient_rewards).sum() / patient_weights.sum() * len(patient_weights)
 
-    weights_per_trajectory_list.append(patient_weights.mean())
     total_rewards_per_trajectory_list.append(patient_rewards.sum())
     weighted_rewards_per_trajectory_list.append(est_total_reward_per_traj)
     
@@ -689,6 +701,88 @@ total_rewards_per_trajectory_list = np.array(total_rewards_per_trajectory_list)
 weighted_rewards_per_trajectory_list = np.array(weighted_rewards_per_trajectory_list)
 
 wis_trajectory_level = (weights_per_trajectory_list * weighted_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum() 
+
+#wis_trajectory_level = weighted_rewards_per_trajectory_list.mean()
+
+# METHOD 2:
+#
+# Average across transitions to get per-trajectory return R_j = sum_t r_t,
+# then weight across trajectories with
+#   w_j = prod_t [pi_model(a_t|s_t) / pi_clinician(a_t|s_t)]
+#   R_WIS = sum_j w_j * R_j / sum_j w_j
+# trajectory_returns_method2 = []
+# trajectory_is_weights_method2 = []
+
+# for patient_id in unique_patients:
+#     patient_mask = eval_patient_ids == patient_id
+#     patient_rewards = eval_rewards[patient_mask]
+#     trajectory_step_ratios = is_weight[patient_mask]
+#     if use_is_clipping:
+#         trajectory_step_ratios = np.clip(trajectory_step_ratios, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+
+#     # R_j: total trajectory return
+#     trajectory_returns_method2.append(patient_rewards.sum())
+
+#     # w_j = prod_t ratio_t, with epsilon guard for numerical stability
+#     trajectory_weight = np.prod(trajectory_step_ratios)
+#     if use_is_clipping:
+#         trajectory_weight = np.clip(trajectory_weight, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+#     trajectory_is_weights_method2.append(trajectory_weight)
+
+# total_rewards_per_trajectory_list = np.array(trajectory_returns_method2)
+# weights_per_trajectory_list = np.array(trajectory_is_weights_method2)
+# weighted_rewards_per_trajectory_list = total_rewards_per_trajectory_list.copy()
+
+# if weights_per_trajectory_list.sum() > 0:
+#     wis_trajectory_level = (weights_per_trajectory_list * total_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum()
+# else:
+#     wis_trajectory_level = 0.0
+
+
+# METHOD 3:
+#
+# Weight across transitions, average across trajectories:
+#   w_j = prod_{t_i=0}^j [pi_model(a_{t_i}|s_{t_i}) / pi_clinician(a_{t_i}|s_{t_i})]
+#   R_traj = T * (sum_j w_j * R_j) / (sum_j w_j)
+#   R_WIS = (1/N) * sum_i R_traj^{(i)}
+# weights_per_trajectory_list = [] 
+# total_rewards_per_trajectory_list = []
+# weighted_rewards_per_trajectory_list = []
+
+# for patient_id in unique_patients:
+#     patient_mask = eval_patient_ids == patient_id
+#     patient_rewards = eval_rewards[patient_mask]
+#     patient_ratios = np.clip(is_weight[patient_mask], eps, None)
+#     if use_is_clipping:
+#         patient_ratios = np.clip(patient_ratios, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+
+#     # Transition-level cumulative products: w_j = prod_{t<=j} ratio_t
+#     cumulative_weights = np.cumprod(patient_ratios)
+#     if use_is_clipping:
+#         cumulative_weights = np.clip(cumulative_weights, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+
+#     # R_traj = T * sum_j(w_j * r_j) / sum_j(w_j)
+#     T = len(patient_rewards)
+#     if T > 0 and cumulative_weights.sum() > 0:
+#         est_total_reward_per_traj = T * (cumulative_weights * patient_rewards).sum() / cumulative_weights.sum()
+#     else:
+#         est_total_reward_per_traj = 0.0
+
+#     # Store raw trajectory return and model-estimated trajectory return
+#     total_rewards_per_trajectory_list.append(patient_rewards.sum())
+#     weighted_rewards_per_trajectory_list.append(est_total_reward_per_traj)
+
+#     # Method 3 averages across trajectories equally (not weighted across trajectories)
+#     weights_per_trajectory_list.append(1.0)
+
+# # Compute mean WIS across all trajectories
+# weights_per_trajectory_list = np.array(weights_per_trajectory_list)
+# total_rewards_per_trajectory_list = np.array(total_rewards_per_trajectory_list)
+# weighted_rewards_per_trajectory_list = np.array(weighted_rewards_per_trajectory_list)
+
+# wis_trajectory_level = weighted_rewards_per_trajectory_list.mean() if len(weighted_rewards_per_trajectory_list) > 0 else 0.0
+
+
 
 # Also compute raw clinician per-trajectory for comparison
 clinician_per_trajectory_mean = total_rewards_per_trajectory_list.mean()
@@ -736,3 +830,110 @@ print(f"\nPer-trajectory WIS evaluation with 95% CI:")
 print(f"  Clinician policy (raw):        {clinician_per_trajectory_mean:.4f}")
 print(f"  Model policy (WIS):            {wis_trajectory_level:.4f}")
 print(f"  Difference (Model - Clinician): {improvement_mean:.4f} (95% CI: [{ci_diff_lower:.4f}, {ci_diff_upper:.4f}])")
+
+# =============================================================================
+# IMPORTANCE SAMPLING DIAGNOSTICS
+# (i)   Effective Sample Size (ESS) as fraction of total N
+# (ii)  Histograms of normalized importance weight distributions
+# (iii) Maximum weight ratio  max_j w_j / sum_j w_j
+# References: Thomas et al. (2015); Precup et al. (2000)
+# =============================================================================
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+# Extract model name from checkpoint path for output file naming
+model_name = os.path.splitext(os.path.basename(model_path))[0]
+
+print("\n" + "="*70)
+print(f"IMPORTANCE SAMPLING DIAGNOSTICS (model: {model_name})")
+print("="*70)
+
+# --- (i) Effective Sample Size ---
+# Kish's ESS = (sum w_i)^2 / sum(w_i^2)
+ess_transition = is_weight.sum()**2 / (is_weight**2).sum()
+ess_transition_frac = ess_transition / len(is_weight)
+
+ess_trajectory = weights_per_trajectory_list.sum()**2 / (weights_per_trajectory_list**2).sum()
+ess_trajectory_frac = ess_trajectory / len(weights_per_trajectory_list)
+
+print(f"\n(i) Effective Sample Size (ESS):")
+print(f"  Per-transition level:")
+print(f"    ESS:            {ess_transition:.2f}")
+print(f"    Total N:        {len(is_weight)}")
+print(f"    ESS / N:        {ess_transition_frac:.4f} ({ess_transition_frac*100:.2f}%)")
+print(f"  Per-trajectory level:")
+print(f"    ESS:            {ess_trajectory:.2f}")
+print(f"    Total N:        {len(weights_per_trajectory_list)}")
+print(f"    ESS / N:        {ess_trajectory_frac:.4f} ({ess_trajectory_frac*100:.2f}%)")
+
+# --- (iii) Maximum Weight Ratio ---
+max_weight_ratio_transition = is_weight.max() / is_weight.sum()
+max_weight_ratio_trajectory = weights_per_trajectory_list.max() / weights_per_trajectory_list.sum()
+
+print(f"\n(iii) Maximum Weight Ratio (single-sample dominance):")
+print(f"  Per-transition:   max(w)/sum(w) = {max_weight_ratio_transition:.6f} ({max_weight_ratio_transition*100:.4f}%)")
+print(f"  Per-trajectory:   max(w)/sum(w) = {max_weight_ratio_trajectory:.6f} ({max_weight_ratio_trajectory*100:.4f}%)")
+
+# --- (ii) Histograms of Normalized Importance Weight Distributions ---
+norm_weights_transition = is_weight / is_weight.sum()
+norm_weights_trajectory = weights_per_trajectory_list / weights_per_trajectory_list.sum()
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+axes[0].hist(norm_weights_transition, bins=50, edgecolor='black', alpha=0.7)
+axes[0].axvline(1.0 / len(norm_weights_transition), color='red', linestyle='--',
+                label=f'Uniform = {1.0/len(norm_weights_transition):.2e}')
+axes[0].set_xlabel('Normalized IS Weight')
+axes[0].set_ylabel('Count')
+axes[0].set_title(f'Per-Transition Normalized Weights\n'
+                  f'ESS/N={ess_transition_frac:.4f}, '
+                  f'max(w)/sum(w)={max_weight_ratio_transition:.4e}')
+axes[0].legend()
+axes[0].set_yscale('log')
+
+axes[1].hist(norm_weights_trajectory, bins=50, edgecolor='black', alpha=0.7, color='orange')
+axes[1].axvline(1.0 / len(norm_weights_trajectory), color='red', linestyle='--',
+                label=f'Uniform = {1.0/len(norm_weights_trajectory):.2e}')
+axes[1].set_xlabel('Normalized IS Weight')
+axes[1].set_ylabel('Count')
+axes[1].set_title(f'Per-Trajectory Normalized Weights\n'
+                  f'ESS/N={ess_trajectory_frac:.4f}, '
+                  f'max(w)/sum(w)={max_weight_ratio_trajectory:.4e}')
+axes[1].legend()
+axes[1].set_yscale('log')
+
+plt.tight_layout()
+hist_path = f'latex/is_weight_histograms_{model_name}.png'
+plt.savefig(hist_path, dpi=150, bbox_inches='tight')
+plt.close()
+print(f"\n(ii) Weight distribution histograms saved to: {hist_path}")
+
+# --- Summary diagnostics table (LaTeX) ---
+diagnostics_latex = r"""\begin{table}[h]
+\centering
+\caption{Importance Sampling Diagnostics (%s)}
+\label{tab:is_diagnostics_%s}
+\begin{tabular}{lcc}
+\hline
+\textbf{Diagnostic} & \textbf{Per-Transition} & \textbf{Per-Trajectory} \\
+\hline
+Effective Sample Size (ESS) & %.2f & %.2f \\
+Total $N$ & %d & %d \\
+ESS / $N$ & %.4f & %.4f \\
+Max weight ratio $\max_j w_j / \sum_j w_j$ & %.6f & %.6f \\
+\hline
+\end{tabular}
+\end{table}
+""" % (
+    model_name.replace('_', r'\_'), model_name,
+    ess_transition, ess_trajectory,
+    len(is_weight), len(weights_per_trajectory_list),
+    ess_transition_frac, ess_trajectory_frac,
+    max_weight_ratio_transition, max_weight_ratio_trajectory
+)
+
+diagnostics_latex_file = f'latex/is_diagnostics_{model_name}.tex'
+with open(diagnostics_latex_file, 'w') as f:
+    f.write(diagnostics_latex)
+print(f"Diagnostics LaTeX table saved to: {diagnostics_latex_file}")
