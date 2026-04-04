@@ -30,6 +30,13 @@ parser.add_argument('--temperature', type=float, default=1.0,
                    help='Temperature for softmax policy (default: 1.0)')
 parser.add_argument('--sequence_length', type=int, default=40,
                    help='Sequence length for U-Net processing (default: 40)')
+parser.add_argument('--combined_or_train_data_path', type=str, default=None,
+                   help='Path to training dataset. If eval_data_path is also provided, '
+                        'all patients from this dataset are used for training. '
+                        'If eval_data_path is None, this dataset is split into train/val/test.')
+parser.add_argument('--eval_data_path', type=str, default=None,
+                   help='Path to evaluation dataset (for val/test). If provided, enables '
+                        'dual-dataset mode where this dataset is split 50/50 into val/test.')
 args = parser.parse_args()
 
 n_bins = args.vp2_bins
@@ -108,7 +115,11 @@ print("="*70)
 print(f"Evaluation set: {eval_set}")
 
 # Initialize data pipeline with manual rewards (IRL policy models generate their own rewards)
-pipeline = IntegratedDataPipelineV3(model_type='dual', reward_source='manual', random_seed=42)
+pipeline = IntegratedDataPipelineV3(
+    model_type='dual', reward_source='manual', random_seed=42,
+    combined_or_train_data_path=args.combined_or_train_data_path,
+    eval_data_path=args.eval_data_path
+)
 train_data, val_data, test_data = pipeline.prepare_data()
 
 # Select evaluation data based on eval_set argument
