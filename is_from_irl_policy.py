@@ -37,6 +37,14 @@ parser.add_argument('--combined_or_train_data_path', type=str, default=None,
 parser.add_argument('--eval_data_path', type=str, default=None,
                    help='Path to evaluation dataset (for val/test). If provided, enables '
                         'dual-dataset mode where this dataset is split 50/50 into val/test.')
+parser.add_argument('--disable_is_clipping', action='store_true',
+                   help='Disable percentile-based clipping for IS weights')
+parser.add_argument('--is_clip_lower_pct', type=float, default=0.5,
+                   help='Lower percentile for IS weight clipping (default: 0.5)')
+parser.add_argument('--is_clip_upper_pct', type=float, default=99.5,
+                   help='Upper percentile for IS weight clipping (default: 99.5)')
+parser.add_argument('--quick_test', action='store_true',
+                   help='Quick test mode: only process 5 trajectories')
 args = parser.parse_args()
 
 n_bins = args.vp2_bins
@@ -45,6 +53,8 @@ model_type = args.model_type
 eval_set = args.eval_set
 temperature = args.temperature
 sequence_length = args.sequence_length
+use_is_clipping = True
+quick_test = args.quick_test
 
 # Define constants
 n_actions = 2 * n_bins  # VP1 (2 options) x VP2 (n_bins) = total actions
@@ -129,6 +139,19 @@ if eval_set == 'val':
 else:
     eval_data = test_data
     eval_set_name = "Test"
+
+# Quick test mode: limit to 5 trajectories
+if quick_test:
+    print("\n*** QUICK TEST MODE: limiting to 5 trajectories ***")
+    for dataset_name, dataset in [('train_data', train_data), ('eval_data', eval_data)]:
+        unique_pids = np.unique(dataset['patient_ids'])[:5]
+        mask = np.isin(dataset['patient_ids'], unique_pids)
+        for key in dataset:
+            dataset[key] = dataset[key][mask]
+    if eval_set == 'val':
+        val_data = eval_data
+    else:
+        test_data = eval_data
 
 # Print data statistics
 print(f"\nData splits:")
@@ -519,7 +542,7 @@ eval_rewards = eval_data['rewards']
 # Compute IS-weighted rewards
 is_weighted_rewards = is_weight * eval_rewards
 
-print(f"\nReward statistics ({reward_type}):")
+print(f"\nReward statistics (CD):")
 print(f"  Raw rewards (clinician)     - Mean: {eval_rewards.mean():.4f}, Std: {eval_rewards.std():.4f}, Sum: {eval_rewards.sum():.2f}")
 print(f"  IS-weighted rewards (model) - Mean: {is_weighted_rewards.mean():.4f}, Std: {is_weighted_rewards.std():.4f}, Sum: {is_weighted_rewards.sum():.2f}")
 
@@ -849,9 +872,6 @@ print(f"  Difference (Model - Clinician): {improvement_mean:.4f} (95% CI: [{ci_d
 # (iii) Maximum weight ratio  max_j w_j / sum_j w_j
 # References: Thomas et al. (2015); Precup et al. (2000)
 # =============================================================================
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 
 # Extract model name from checkpoint path for output file naming
 model_name = os.path.splitext(os.path.basename(model_path))[0]
@@ -889,6 +909,10 @@ print(f"  Per-trajectory:   max(w)/sum(w) = {max_weight_ratio_trajectory:.6f} ({
 # --- (ii) Histograms of Normalized Importance Weight Distributions ---
 norm_weights_transition = is_weight / is_weight.sum()
 norm_weights_trajectory = weights_per_trajectory_list / weights_per_trajectory_list.sum()
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
