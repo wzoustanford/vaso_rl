@@ -422,6 +422,7 @@ else
             fi
             if [ "$TIME_ONE_BATCH" == "true" ]; then
                 UNET_CMD="$UNET_CMD --time_one_batch"
+            fi
             if [ -n "$UNET_ABLATION" ]; then
                 UNET_CMD="$UNET_CMD --ablation_setting $UNET_ABLATION"
             fi
