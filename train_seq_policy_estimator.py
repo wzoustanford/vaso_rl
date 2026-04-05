@@ -97,7 +97,7 @@ class SeqPolicyEstimatorTrainer:
         one_hot = F.one_hot(action_indices, num_classes=self.n_actions).float()
         return torch.cat([states, one_hot], dim=-1)
 
-    def train(self, states, actions, patient_ids, epochs: int = 100, batch_size: int = 128):
+    def train(self, states, actions, patient_ids, epochs: int = 50, batch_size: int = 128):
         """
         Train the sequential policy estimator.
         50% expert data (label=1), 50% same states with random actions (label=0).
