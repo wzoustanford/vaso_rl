@@ -34,10 +34,11 @@ set -e  # Exit on error
 # Default values
 ALGORITHM="${1:-gcl}"
 IRL_EPOCHS=100
-QL_EPOCHS=100
+QL_EPOCHS=50
 VP2_BINS=5
 TEST_MODE=false
 SUFFIX=""
+TIME_ONE_BATCH=false
 
 # GCL-specific defaults
 GCL_TAU=0.005
@@ -109,6 +110,10 @@ while [[ $# -gt 0 ]]; do
         --suffix)
             SUFFIX="$2"
             shift 2
+            ;;
+        --time_one_batch)
+            TIME_ONE_BATCH=true
+            shift
             ;;
         --gcl_tau)
             GCL_TAU="$2"
@@ -242,6 +247,7 @@ echo "IRL Epochs: $IRL_EPOCHS"
 echo "QL Epochs: $QL_EPOCHS"
 echo "VP2 Bins: $VP2_BINS"
 echo "Test Mode: $TEST_MODE"
+echo "Time One Batch: $TIME_ONE_BATCH"
 echo "Skip IRL: $SKIP_IRL"
 echo "Suffix: $SUFFIX"
 if [ "$ALGORITHM" == "gcl" ]; then
@@ -414,15 +420,26 @@ else
             if [ -n "$EVAL_DATA_PATH" ]; then
                 UNET_CMD="$UNET_CMD --eval_data_path $EVAL_DATA_PATH"
             fi
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                UNET_CMD="$UNET_CMD --time_one_batch"
+            fi
             if [ -n "$UNET_ABLATION" ]; then
                 UNET_CMD="$UNET_CMD --ablation_setting $UNET_ABLATION"
             fi
             eval $UNET_CMD
-            # Find the latest model (tanh version adds _tanh suffix)
-            REWARD_MODEL_PATH=$(ls -t "${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"/model_epoch_*.pt 2>/dev/null | head -1)
-            if [ -z "$REWARD_MODEL_PATH" ]; then
-                echo "Error: No U-Net model found in ${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"
-                exit 1
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                REWARD_MODEL_PATH="${UNET_DIR}_${UNET_CONV_H_DIM}_tanh/timing_batch_model.pt"
+                if [ ! -f "$REWARD_MODEL_PATH" ]; then
+                    echo "Error: Expected timing-mode U-Net model not found: $REWARD_MODEL_PATH"
+                    exit 1
+                fi
+            else
+                # Find the latest model (tanh version adds _tanh suffix)
+                REWARD_MODEL_PATH=$(ls -t "${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"/model_epoch_*.pt 2>/dev/null | head -1)
+                if [ -z "$REWARD_MODEL_PATH" ]; then
+                    echo "Error: No U-Net model found in ${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"
+                    exit 1
+                fi
             fi
             ;;
         unet_maxent)
@@ -612,6 +629,9 @@ else
     if [ -n "$EVAL_DATA_PATH" ]; then
         QL_CMD="$QL_CMD --eval_data_path $EVAL_DATA_PATH"
     fi
+    if [ "$TIME_ONE_BATCH" == "true" ]; then
+        QL_CMD="$QL_CMD --time_one_batch"
+    fi
 
     eval $QL_CMD
 
@@ -625,8 +645,14 @@ else
 fi
 
 # Find the saved Q-learning model (alpha format is 0.0000)
-QL_MODEL_PATH="${QL_DIR}/${MODEL_PREFIX}_alpha0.0000_bins${VP2_BINS}_best.pt"
-echo "Q-Learning complete. Model saved to: $QL_MODEL_PATH"
+if [ "$TIME_ONE_BATCH" == "true" ]; then
+    QL_MODEL_PATH="N/A (time_one_batch mode)"
+    echo "Q-Learning one-batch timing complete."
+    exit 0
+else
+    QL_MODEL_PATH="${QL_DIR}/${MODEL_PREFIX}_alpha0.0000_bins${VP2_BINS}_best.pt"
+    echo "Q-Learning complete. Model saved to: $QL_MODEL_PATH"
+fi
 
 # Step 3: WIS Evaluation
 echo ""

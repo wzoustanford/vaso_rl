@@ -332,7 +332,8 @@ def train_block_discrete_cql(
     reward_combine_lambda: float = None,
     combined_or_train_data_path: str = None,
     eval_data_path: str = None,
-    irl_vp2_bins: int = None
+    irl_vp2_bins: int = None,
+    time_one_batch: bool = False
 ):
     """Train Block Discrete CQL with specified alpha and optional learned reward
 
@@ -340,7 +341,7 @@ def train_block_discrete_cql(
         alpha: CQL penalty strength
         vp2_bins: Number of bins for VP2 discretization (for Q-learning action space)
         epochs: Number of training epochs
-        reward_model_path: Path to learned reward model (gcl/iq_learn/maxent/unet)
+        reward_model_path: Path to learned reward model (gcl/iq_learn/maxent/unet/transformer)
         suffix: Suffix to add to experiment prefix
         save_dir: Directory to save models
         reward_combine_lambda: If None, use pure IRL reward. If in [0, 1], use
@@ -410,7 +411,18 @@ def train_block_discrete_cql(
         # Use irl_vp2_bins for loading (IRL model's action space), not vp2_bins (Q-learning action space)
         pipeline.load_semi_supervised_unet_reward_model(reward_model_path, vp1_bins=2, vp2_bins=irl_vp2_bins)
         print(f"  IRL model vp2_bins: {irl_vp2_bins}, Q-learning vp2_bins: {vp2_bins}")
-    elif reward_model_path.split('/')[-1].startswith('unet'):
+    elif 'transformer' in reward_model_path:
+        # Transformer reward model provides learned rewards via per-trajectory inference
+        reward_type = "transformer"
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
+        )
+        pipeline.load_trans_reward_model(reward_model_path, vp1_bins=2, vp2_bins=irl_vp2_bins)
+        print(f"  IRL model vp2_bins: {irl_vp2_bins}, Q-learning vp2_bins: {vp2_bins}")
+    elif 'unet' in reward_model_path:
         # U-Net provides learned rewards via per-trajectory inference
         reward_type = "unet"
         pipeline = IntegratedDataPipelineV3(
@@ -523,6 +535,15 @@ def train_block_discrete_cql(
             dones = torch.FloatTensor(batch['dones']).to(agent.device)
             
             # Update agent
+            if time_one_batch:
+                start = time.time()
+                metrics = agent.update(states, actions, rewards, next_states, dones)
+                end = time.time()
+                print(f"QL_BATCH_SHAPE={tuple(states.shape)}", flush=True)
+                print(f"QL_BATCH_TRANSITIONS={states.shape[0]}", flush=True)
+                print(f"QL_BATCH_TIME_SECONDS={end - start}", flush=True)
+                return agent, pipeline, experiment_prefix
+
             metrics = agent.update(states, actions, rewards, next_states, dones)
             
             # Accumulate metrics
@@ -607,7 +628,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=50,
                        help='Number of training epochs (default: 100)')
     parser.add_argument('--reward_model_path', type=str, default=None,
-                       help='Path to learned reward model (gcl/iq_learn/maxent). None=manual reward')
+                       help='Path to learned reward model (gcl/iq_learn/maxent/unet/transformer). None=manual reward')
     parser.add_argument('--suffix', type=str, default='',
                        help='Suffix to add to experiment prefix (e.g., "_irl100")')
     parser.add_argument('--save_dir', type=str, default='experiment/ql',
@@ -626,6 +647,8 @@ def main():
                        help='Number of VP2 bins used to train the IRL model. If None, uses '
                             'the same value as --vp2_bins. This allows loading an IRL model '
                             'trained with different discretization than the Q-learning action space.')
+    parser.add_argument('--time_one_batch', action='store_true',
+                       help='Run one Q-learning training batch, print timing, and exit.')
     args = parser.parse_args()
 
     # Determine alpha values to use
@@ -676,7 +699,8 @@ def main():
             reward_combine_lambda=args.reward_combine_lambda,
             combined_or_train_data_path=args.combined_or_train_data_path,
             eval_data_path=args.eval_data_path,
-            irl_vp2_bins=irl_vp2_bins
+            irl_vp2_bins=irl_vp2_bins,
+            time_one_batch=args.time_one_batch
         )
         experiment_prefixes.append(exp_prefix)
 

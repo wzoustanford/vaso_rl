@@ -211,7 +211,7 @@ class IntegratedDataPipelineV3:
 
         # Learned reward model (loaded separately)
         self.reward_model = None
-        self.reward_model_type = None  # 'gcl', 'iq_learn', 'maxent', or 'unet'
+        self.reward_model_type = None  # 'gcl', 'iq_learn', 'maxent', 'unet', or 'transformer'
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # U-Net specific parameters (set when loading U-Net model)
@@ -338,8 +338,9 @@ class IntegratedDataPipelineV3:
             action_size=action_size,
             conv_h_dim=conv_h_dim
         ).to(self.device)
-        self.reward_model.load_state_dict(checkpoint['model_state_dict'])
         self.reward_model_type = 'unet'
+
+        self.reward_model.load_state_dict(checkpoint['model_state_dict'])
         self.reward_model.eval()
 
         print(f"Loaded U-Net reward model from: {checkpoint_path}")
@@ -347,99 +348,52 @@ class IntegratedDataPipelineV3:
         print(f"  vp1_bins: {vp1_bins}, vp2_bins: {vp2_bins}")
         print(f"  Reward = per-timestep output from U-Net")
 
-    def load_unet_maxent_reward_model(self, checkpoint_path: str, vp1_bins: int = 2, vp2_bins: int = 5):
+    def load_trans_reward_model(self, checkpoint_path: str, vp1_bins: int = 2, vp2_bins: int = 5):
         """
-        Load U-Net model for reward computation.
-        U-Net outputs per-timestep rewards for each trajectory.
+        Load transformer reward model for reward computation.
+        Transformer outputs per-timestep rewards for each trajectory.
 
         Args:
-            checkpoint_path: Path to U-Net checkpoint (.pt file)
+            checkpoint_path: Path to transformer checkpoint (.pt file)
             vp1_bins: Number of VP1 bins (default 2 for binary)
             vp2_bins: Number of VP2 bins (default 5)
-
-        Note: vp1_bins and vp2_bins should match the model's action_size.
-        TODO: Future improvement - read these from the model checkpoint directly.
         """
-        from unet_reward_generator_tanh_maxent import UNetRewardGenerator
+        from transformer_reward_generator_tanh import TransformerRewardGenerator
 
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
-        # Get model parameters from checkpoint
-        state_size = checkpoint.get('state_size')
+        state_size = checkpoint['state_size']
         action_size = checkpoint.get('action_size', vp1_bins * vp2_bins)
-        conv_h_dim = checkpoint.get('conv_h_dim', 64)
+        d_model = checkpoint.get('d_model', 128)
+        nhead = checkpoint.get('nhead', 8)
+        num_layers = checkpoint.get('num_layers', 4)
+        d_ff = checkpoint.get('d_ff', 512)
+        dropout = checkpoint.get('dropout', 0.1)
+        max_seq_length = checkpoint.get('max_seq_length', 512)
 
-        # Fallback: infer from model weights if not found
-        if state_size is None:
-            input_size = checkpoint['model_state_dict']['enc1.0.weight'].shape[1]
-            state_size = input_size - action_size
-
-        # Store U-Net specific parameters
         self.unet_vp1_bins = vp1_bins
         self.unet_vp2_bins = vp2_bins
         self.unet_n_actions = vp1_bins * vp2_bins
 
-        # Initialize and load model
-        self.reward_model = UNetRewardGenerator(
+        self.reward_model = TransformerRewardGenerator(
             state_size=state_size,
             action_size=action_size,
-            conv_h_dim=conv_h_dim
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
+            d_ff=d_ff,
+            dropout=dropout,
+            max_seq_length=max_seq_length
         ).to(self.device)
         self.reward_model.load_state_dict(checkpoint['model_state_dict'])
-        self.reward_model_type = 'unet_maxent'
-        self.reward_model.eval()
-        
-        print(f"Loaded U-Net reward model from: {checkpoint_path}")
-        print(f"  state_size: {state_size}, action_size: {action_size}, conv_h_dim: {conv_h_dim}")
-        print(f"  vp1_bins: {vp1_bins}, vp2_bins: {vp2_bins}")
-        print(f"  Reward = per-timestep output from U-Net")
-
-    def load_transformer_context_irl_reward_model(self, checkpoint_path: str, vp1_bins: int = 2, vp2_bins: int = 5):
-        """
-        Load U-Net model for reward computation.
-        U-Net outputs per-timestep rewards for each trajectory.
-
-        Args:
-            checkpoint_path: Path to U-Net checkpoint (.pt file)
-            vp1_bins: Number of VP1 bins (default 2 for binary)
-            vp2_bins: Number of VP2 bins (default 5)
-
-        Note: vp1_bins and vp2_bins should match the model's action_size.
-        TODO: Future improvement - read these from the model checkpoint directly.
-        """
-        from transformer_reward_generator_tanh import TransformerCIRLRewardGenerator
-
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-
-        # Get model parameters from checkpoint
-        state_size = checkpoint.get('state_size')
-        action_size = checkpoint.get('action_size', vp1_bins * vp2_bins)
-        d_model = checkpoint.get('d_model', 64)
-
-        # Fallback: infer from model weights if not found
-        if state_size is None:
-            input_size = checkpoint['model_state_dict']['enc1.0.weight'].shape[1]
-            state_size = input_size - action_size
-
-        # Store U-Net specific parameters
-        self.unet_vp1_bins = vp1_bins
-        self.unet_vp2_bins = vp2_bins
-        self.unet_n_actions = vp1_bins * vp2_bins
-
-        # Initialize and load model
-        self.reward_model = TransformerCIRLRewardGenerator(
-            state_size=state_size,
-            action_size=action_size,
-            conv_h_dim=d_model
-        ).to(self.device)
-        self.reward_model.load_state_dict(checkpoint['model_state_dict'])
-        self.reward_model_type = 'transformer_context_irl'
+        self.reward_model_type = 'transformer'
         self.reward_model.eval()
 
-        print(f"Loaded U-Net reward model from: {checkpoint_path}")
-        print(f"  state_size: {state_size}, action_size: {action_size}, conv_h_dim: {d_model}")
+        print(f"Loaded transformer reward model from: {checkpoint_path}")
+        print(f"  state_size: {state_size}, action_size: {action_size}, d_model: {d_model}")
+        print(f"  nhead: {nhead}, num_layers: {num_layers}, d_ff: {d_ff}, dropout: {dropout}")
         print(f"  vp1_bins: {vp1_bins}, vp2_bins: {vp2_bins}")
-        print(f"  Reward = per-timestep output from U-Net")
+        print(f"  Reward = per-timestep output from transformer")
 
     def load_semi_supervised_unet_reward_model(self, checkpoint_path: str, vp1_bins: int = 2, vp2_bins: int = 5):
         """
@@ -839,7 +793,7 @@ class IntegratedDataPipelineV3:
         Recompute rewards using the learned reward model on normalized states.
         Called after data processing when reward_source='learned'.
 
-        For U-Net: Process by trajectory since U-Net needs full sequences.
+        For U-Net/transformer: Process by trajectory since the reward model needs full sequences.
         For GCL/IQ-Learn/MaxEnt: Process in batches.
 
         If reward_combine_lambda is set, combines manual and IRL rewards:
@@ -862,10 +816,10 @@ class IntegratedDataPipelineV3:
 
             irl_rewards = np.zeros(n_transitions, dtype=np.float32)
 
-            if self.reward_model_type in ('unet', 'semi_supervised_unet'):
-                # U-Net: Process by trajectory (patient)
-                # U-Net requires full trajectory context for reward prediction
-                print(f"   {split_name}: Processing {len(patient_groups)} patients for U-Net rewards...")
+            if self.reward_model_type in ('unet', 'semi_supervised_unet', 'transformer'):
+                # Sequence reward models: process by trajectory (patient)
+                # These models require full trajectory context for reward prediction.
+                print(f"   {split_name}: Processing {len(patient_groups)} patients for sequence-model rewards...")
                 for i, (patient_id, (start_idx, end_idx)) in enumerate(patient_groups.items()):
                     if (i + 1) % 500 == 0:
                         print(f"     Processed {i+1}/{len(patient_groups)} patients")
