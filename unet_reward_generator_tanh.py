@@ -48,6 +48,9 @@ class Config:
 
     # Paths
     experiment_dir: str = "experiments/unet_reward_gen_fixed_32"
+    
+    # Ablation settings
+    ablation_setting: str = None  # Can be "causal", "single_transition_context", or None
 
     def __init__(self, **kwargs):
         for key, value in kwargs.items():
@@ -226,7 +229,7 @@ def compute_training_step(
     states: torch.Tensor,
     actions: torch.Tensor,
     config: Config,
-    device: torch.device
+    device: torch.device, 
 ) -> tuple:
     """
     Compute loss for one batch of sequences.
@@ -286,6 +289,12 @@ def compute_training_step(
         state_action_flat = state_action.permute(0, 2, 1, 3).reshape(
             batch_size * action_size, seq_len, state_size + action_size
         )
+        if config.ablation_setting == "causal": 
+            state_action_flat[:, ct+1:, :] = 0 
+        elif config.ablation_setting == "single_transition_context": 
+            state_action_flat[:, ct+1:, :] = 0 
+            state_action_flat[:, :ct, :] = 0
+        
         rewards_pred = model(state_action_flat)
         rewards_pred = rewards_pred.reshape(batch_size, action_size, seq_len, 1)
         rewards_pred = rewards_pred.squeeze(-1).permute(0, 2, 1)
@@ -594,6 +603,8 @@ def main():
                             'dual-dataset mode where this dataset is split 50/50 into val/test.')
     parser.add_argument('--time_one_batch', action='store_true',
                        help='Run one U-Net training batch, print timing, and exit.')
+    parser.add_argument('--ablation_setting', type=str, default=None,
+                       help='Ablation setting: "causal" or "single_transition_context"')
     args = parser.parse_args()
 
     # Initialize config from command line args
@@ -607,6 +618,7 @@ def main():
         vp1_bins=args.vp1_bins,
         vp2_bins=args.vp2_bins,
         experiment_dir=args.experiment_dir+'_'+str(args.conv_h_dim)+'_tanh',
+        ablation_setting=args.ablation_setting,
     )
 
     print(f"Config: epochs={config.num_epochs}, batch_size={config.batch_size}, "

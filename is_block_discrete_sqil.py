@@ -12,13 +12,12 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Import project modules
-from integrated_data_pipeline_v2 import IntegratedDataPipelineV2
 from integrated_data_pipeline_v3 import IntegratedDataPipelineV3
 
 # Parse command line arguments
-parser = argparse.ArgumentParser(description='Importance Sampling evaluation for Block Discrete CQL')
+parser = argparse.ArgumentParser(description='Importance Sampling evaluation for Block Discrete SQIL')
 parser.add_argument('--model_path', type=str, required=True,
-                   help='Path to trained CQL model checkpoint')
+                   help='Path to trained SQIL model checkpoint')
 parser.add_argument('--vp2_bins', type=int, default=5,
                    help='Number of bins for VP2 discretization (default: 5)')
 parser.add_argument('--eval_set', type=str, default='test', choices=['val', 'test'],
@@ -34,8 +33,6 @@ parser.add_argument('--combined_or_train_data_path', type=str, default=None,
 parser.add_argument('--eval_data_path', type=str, default=None,
                    help='Path to evaluation dataset (for val/test). If provided, enables '
                         'dual-dataset mode where this dataset is split 50/50 into val/test.')
-parser.add_argument('--use_lstm', action='store_true',
-                   help='Use LSTM Q-network instead of standard feedforward network')
 parser.add_argument('--disable_is_clipping', action='store_true',
                    help='Disable percentile-based clipping for IS weights and trajectory multiplied weights')
 parser.add_argument('--is_clip_lower_pct', type=float, default=0.5,
@@ -55,62 +52,39 @@ model_path = args.model_path
 eval_set = args.eval_set
 reward_type = args.reward_type
 irl_model_path = args.irl_model_path
-use_lstm = args.use_lstm
 use_is_clipping = not args.disable_is_clipping
 
 # Define constants
 STATE_DIM = 17  # 17 state features for dual model
 
 ### define the block discrete model
-# - load the trained block discrete model
+# - load the trained SQIL model (same Q-network architecture as CQL)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
 # Model parameters
-n_actions = 2 * n_bins  # VP1 (2 options: 0,1) x VP2 (5 bins) = 10 total actions
+n_actions = 2 * n_bins  # VP1 (2 options: 0,1) x VP2 (n_bins) = total actions
 state_dim = STATE_DIM  # 17 features
 
-# Initialize and load Q-networks based on model type
-if use_lstm:
-    # Import LSTM network class
-    from lstm_block_discrete_cql_network import LSTMDiscreteQNetwork
+# Import the Q-network class from the SQIL training script
+from run_block_discrete_sqil import DualBlockDiscreteQNetwork
 
-    # LSTM uses num_actions directly (not 2*n_bins structure)
-    q1_network = LSTMDiscreteQNetwork(state_dim=state_dim, num_actions=n_actions).to(device)
-    q2_network = LSTMDiscreteQNetwork(state_dim=state_dim, num_actions=n_actions).to(device)
+# Initialize Q-networks (we use both Q1 and Q2, then take min)
+q1_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
+q2_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
 
-    # Load the trained model checkpoint
-    checkpoint = torch.load(model_path, map_location=device)
-    q1_network.load_state_dict(checkpoint['q1_state_dict'])
-    q2_network.load_state_dict(checkpoint['q2_state_dict'])
-    q1_network.eval()
-    q2_network.eval()
+# Load the trained model checkpoint
+checkpoint = torch.load(model_path, map_location=device)
+q1_network.load_state_dict(checkpoint['q1_state_dict'])
+q2_network.load_state_dict(checkpoint['q2_state_dict'])
+q1_network.eval()
+q2_network.eval()
 
-    print(f"Loaded LSTM model from: {model_path}")
-    print(f"State dimension: {state_dim}")
-    print(f"Number of actions: {n_actions} (VP1: 2 binary × VP2: {n_bins} bins)")
-    print("Using min(Q1, Q2) for action selection (double Q-learning)")
-    print("Model type: LSTM Q-Network")
-else:
-    # Import the network class from the training script
-    from run_block_discrete_cql_allalphas import DualBlockDiscreteQNetwork
-
-    # Initialize Q-networks (we use both Q1 and Q2, then take min)
-    q1_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
-    q2_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
-
-    # Load the trained model checkpoint
-    checkpoint = torch.load(model_path, map_location=device)
-    q1_network.load_state_dict(checkpoint['q1_state_dict'])
-    q2_network.load_state_dict(checkpoint['q2_state_dict'])
-    q1_network.eval()
-    q2_network.eval()
-
-    print(f"Loaded model from: {model_path}")
-    print(f"State dimension: {state_dim}")
-    print(f"Number of actions: {n_actions} (VP1: 2 binary × VP2: {n_bins} bins)")
-    print("Using min(Q1, Q2) for action selection (double Q-learning)")
-    print("Model type: Feedforward Q-Network") 
+print(f"Loaded SQIL model from: {model_path}")
+print(f"State dimension: {state_dim}")
+print(f"Number of actions: {n_actions} (VP1: 2 binary × VP2: {n_bins} bins)")
+print("Using min(Q1, Q2) for action selection (double Q-learning)")
+print("Model type: SQIL Feedforward Q-Network")
 
 ###
 # prepare and load the data with random seed 42
@@ -205,11 +179,11 @@ print("="*70)
 vp2_bin_edges = np.linspace(0, 0.5, n_bins + 1)
 print(f"VP2 bin edges: {vp2_bin_edges}")
 
-# Helper function to select actions and return DISCRETE indices (0-9) - Feedforward version
+# Helper function to select actions and return DISCRETE indices - Feedforward version
 def select_action_batch_discrete(states, q1_net, q2_net, vp2_bins, device):
     """
     Select best actions for a batch of states using min(Q1, Q2)
-    Returns: numpy array of discrete action indices [0-9]
+    Returns: numpy array of discrete action indices [0 to n_actions-1]
     """
     with torch.no_grad():
         if states.ndim == 1:
@@ -219,7 +193,7 @@ def select_action_batch_discrete(states, q1_net, q2_net, vp2_bins, device):
         state_tensor = torch.FloatTensor(states).to(device)
 
         # Create all possible discrete actions for each state in batch
-        total_actions = 2 * vp2_bins  # 10 actions
+        total_actions = 2 * vp2_bins
         all_actions = torch.arange(total_actions).to(device)
         all_actions = all_actions.unsqueeze(0).expand(batch_size, -1)
 
@@ -233,43 +207,6 @@ def select_action_batch_discrete(states, q1_net, q2_net, vp2_bins, device):
         q2_values = q2_net(state_expanded, actions_flat).reshape(batch_size, total_actions)
         q_values = torch.min(q1_values, q2_values)
 
-        # Get best action indices (0-9)
-        best_action_indices = q_values.argmax(dim=1).cpu().numpy()
-
-        return best_action_indices
-
-
-# Helper function to select actions using LSTM networks
-def select_action_batch_discrete_lstm(states, q1_net, q2_net, device):
-    """
-    Select best actions for a batch of states using LSTM Q-networks with min(Q1, Q2).
-    LSTM networks output Q-values for all actions at once, no need to loop.
-
-    Note: For WIS evaluation, we use fresh hidden states for each state
-    (stateless inference). This is simpler and appropriate since we're
-    evaluating per-transition, not per-trajectory.
-
-    Returns: numpy array of discrete action indices [0-9]
-    """
-    with torch.no_grad():
-        if states.ndim == 1:
-            states = states.reshape(1, -1)
-
-        batch_size = states.shape[0]
-        state_tensor = torch.FloatTensor(states).to(device)
-
-        # Initialize fresh hidden states
-        hidden1 = q1_net.init_hidden(batch_size, device)
-        hidden2 = q2_net.init_hidden(batch_size, device)
-
-        # Forward pass - LSTM returns Q-values for all actions at once
-        # forward_single_step: state [batch_size, state_dim] -> q_values [batch_size, num_actions]
-        q1_values, _ = q1_net.forward_single_step(state_tensor, hidden1)
-        q2_values, _ = q2_net.forward_single_step(state_tensor, hidden2)
-
-        # Take minimum of Q1 and Q2
-        q_values = torch.min(q1_values, q2_values)
-
         # Get best action indices
         best_action_indices = q_values.argmax(dim=1).cpu().numpy()
 
@@ -278,7 +215,7 @@ def select_action_batch_discrete_lstm(states, q1_net, q2_net, device):
 # Helper function to convert continuous actions to discrete indices
 def continuous_to_discrete_action(actions, vp2_edges, vp2_bins):
     """
-    Convert continuous actions [vp1, vp2] to discrete action indices (0-9)
+    Convert continuous actions [vp1, vp2] to discrete action indices
     action_idx = vp1 * n_bins + vp2_bin
     """
     vp1 = actions[:, 0].astype(int)  # Binary 0 or 1
@@ -292,20 +229,14 @@ def continuous_to_discrete_action(actions, vp2_edges, vp2_bins):
     action_indices = vp1 * vp2_bins + vp2_bins_idx
     return action_indices
 
-# Get model actions as discrete indices (0-9)
+# Get model actions as discrete indices
 print("Computing model actions (discrete) for training data...")
-if use_lstm:
-    train_model_actions_discrete = select_action_batch_discrete_lstm(train_data['states'], q1_network, q2_network, device)
-else:
-    train_model_actions_discrete = select_action_batch_discrete(train_data['states'], q1_network, q2_network, n_bins, device)
+train_model_actions_discrete = select_action_batch_discrete(train_data['states'], q1_network, q2_network, n_bins, device)
 
 print(f"Computing model actions (discrete) for {eval_set_name.lower()} data...")
-if use_lstm:
-    eval_model_actions_discrete = select_action_batch_discrete_lstm(eval_data['states'], q1_network, q2_network, device)
-else:
-    eval_model_actions_discrete = select_action_batch_discrete(eval_data['states'], q1_network, q2_network, n_bins, device)
+eval_model_actions_discrete = select_action_batch_discrete(eval_data['states'], q1_network, q2_network, n_bins, device)
 
-# Convert clinician continuous actions to discrete indices (0-9)
+# Convert clinician continuous actions to discrete indices
 train_clinician_actions_discrete = continuous_to_discrete_action(train_data['actions'], vp2_bin_edges, n_bins)
 eval_clinician_actions_discrete = continuous_to_discrete_action(eval_data['actions'], vp2_bin_edges, n_bins)
 
@@ -320,13 +251,13 @@ print(f"\nSample discrete action indices (first 10):")
 print(f"  Model (train):     {train_model_actions_discrete[:10]}")
 print(f"  Clinician (train): {train_clinician_actions_discrete[:10]}")
 
-# Show action distribution (0-9)
-print(f"\nAction distribution (0-9):")
+# Show action distribution
+print(f"\nAction distribution (0-{n_actions-1}):")
 for action_idx in range(n_actions):
     print(f"  Action {action_idx}: Model (train)={np.sum(train_model_actions_discrete==action_idx)}, "
           f"Clinician (train)={np.sum(train_clinician_actions_discrete==action_idx)}, "
           f"Model ({eval_set_name.lower()})={np.sum(eval_model_actions_discrete==action_idx)}, "
-          f"Clinician ({eval_set_name.lower()})={np.sum(eval_clinician_actions_discrete==action_idx)}") 
+          f"Clinician ({eval_set_name.lower()})={np.sum(eval_clinician_actions_discrete==action_idx)}")
 
 ## train a logistic classifier (lg_vp1_ma) to predict the vp1 model actions (binary) using the states on the training data, then use it on the test data to get the probability of clinician vp1 actions
 ## train a logistic classifier (lg_vp1_ca) to predict the vp1 clinician actions (binary) using the states on the training data, then use it on the test data to get the probability of clinician vp1 actions
@@ -407,7 +338,7 @@ print(f"  Index | Model π | Clinician π | Ratio")
 print(f"  " + "-"*50)
 for i in range(min(10, len(eval_prob_model))):
     ratio = eval_prob_model[i] / (eval_prob_clinician[i] + 1e-10)
-    print(f"  {i:5d} | {eval_prob_model[i]:.4f} | {eval_prob_clinician[i]:.4f} | {ratio:.4f}") 
+    print(f"  {i:5d} | {eval_prob_model[i]:.4f} | {eval_prob_clinician[i]:.4f} | {ratio:.4f}")
 
 
 # Finally for each of the transitions (indices) in the test data, compute pi_lg_vp1_ma(s) / (eps + pi_lg_vp1_ca(s)) * pi_sm_vp2_ma(s) / (esp + pi_sm_vp2_ca(s)) * R where R is the reward on that transition index or state, this is the expected reward using the model actions on that state
@@ -503,8 +434,8 @@ os.makedirs('latex', exist_ok=True)
 # Save results to LaTeX table
 latex_output = r"""\begin{table}[h]
 \centering
-\caption{Importance Sampling Off-Policy Evaluation Results (Block Discrete CQL, $\alpha=0.0$)}
-\label{tab:is_ope_results}
+\caption{Importance Sampling Off-Policy Evaluation Results (Block Discrete SQIL)}
+\label{tab:is_ope_results_sqil}
 \begin{tabular}{lcc}
 \hline
 \textbf{Metric} & \textbf{Clinician Policy} & \textbf{Model Policy (IS)} \\
@@ -538,7 +469,7 @@ Per-Patient & \multicolumn{2}{c}{%.4f} \\
     avg_is_reward_per_patient - avg_raw_reward_per_patient
 )
 
-latex_file = 'latex/is_ope_results.tex'
+latex_file = 'latex/is_sqil_ope_results.tex'
 with open(latex_file, 'w') as f:
     f.write(latex_output)
 
@@ -592,25 +523,12 @@ print("="*70)
 # Then average across all patients
 
 # METHOD 1
-weights_per_trajectory_list = [] 
+weights_per_trajectory_list = []
 total_rewards_per_trajectory_list = []
 weighted_rewards_per_trajectory_list = []
 
 for patient_id in unique_patients:
     patient_mask = eval_patient_ids == patient_id
-    """
-    mean_model_prob = eval_prob_model[patient_mask].mean()
-    mean_clinician_prob = eval_prob_clinician[patient_mask].mean()
-    patient_rewards = eval_rewards[patient_mask]
-    traj_is_weight = mean_model_prob /(1e-8 + mean_clinician_prob)
-
-    if not traj_is_weight == 0:
-        #weights_per_trajectory_list.append(patient_weights.prod())
-        weights_per_trajectory_list.append(traj_is_weight)
-        total_rewards_per_trajectory_list.append(patient_rewards.sum())
-    else:
-        print("zero encountered in trajectory level multiplied weights")
-    """
 
     # Get weights and rewards for this trajectory
     patient_weights = is_weight[patient_mask]
@@ -620,109 +538,18 @@ for patient_id in unique_patients:
     patient_weights = np.cumprod(patient_weights)
     if use_is_clipping:
         patient_weights = np.clip(patient_weights, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
-    
-    # np.clip(is_weight, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
+
     est_total_reward_per_traj = (patient_weights *  patient_rewards).sum() / patient_weights.sum() * len(patient_weights)
 
     total_rewards_per_trajectory_list.append(patient_rewards.sum())
     weighted_rewards_per_trajectory_list.append(est_total_reward_per_traj)
-    
-
-#wisw_ci_diff_lower = np.percentile(weights_per_trajectory_list, 5)
-#wisw_ci_diff_upper = np.percentile(weights_per_trajectory_list, 95)
-
-#weights_per_trajectory_list = np.clip(weights_per_trajectory_list, a_min = wisw_ci_diff_lower, a_max = wisw_ci_diff_upper)
-
-#weights_per_trajectory_list = np.clip(weights_per_trajectory_list, a_min = 0.0, a_max = 10)
 
 # Compute mean WIS across all trajectories
 weights_per_trajectory_list = np.array(weights_per_trajectory_list)
 total_rewards_per_trajectory_list = np.array(total_rewards_per_trajectory_list)
 weighted_rewards_per_trajectory_list = np.array(weighted_rewards_per_trajectory_list)
 
-wis_trajectory_level = (weights_per_trajectory_list * weighted_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum() 
-
-#wis_trajectory_level = weighted_rewards_per_trajectory_list.mean()
-
-# METHOD 2:
-#
-# Average across transitions to get per-trajectory return R_j = sum_t r_t,
-# then weight across trajectories with
-#   w_j = prod_t [pi_model(a_t|s_t) / pi_clinician(a_t|s_t)]
-#   R_WIS = sum_j w_j * R_j / sum_j w_j
-# trajectory_returns_method2 = []
-# trajectory_is_weights_method2 = []
-
-# for patient_id in unique_patients:
-#     patient_mask = eval_patient_ids == patient_id
-#     patient_rewards = eval_rewards[patient_mask]
-#     trajectory_step_ratios = is_weight[patient_mask]
-#     if use_is_clipping:
-#         trajectory_step_ratios = np.clip(trajectory_step_ratios, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
-
-#     # R_j: total trajectory return
-#     trajectory_returns_method2.append(patient_rewards.sum())
-
-#     # w_j = prod_t ratio_t, with epsilon guard for numerical stability
-#     trajectory_weight = np.prod(trajectory_step_ratios)
-#     if use_is_clipping:
-#         trajectory_weight = np.clip(trajectory_weight, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
-#     trajectory_is_weights_method2.append(trajectory_weight)
-
-# total_rewards_per_trajectory_list = np.array(trajectory_returns_method2)
-# weights_per_trajectory_list = np.array(trajectory_is_weights_method2)
-# weighted_rewards_per_trajectory_list = total_rewards_per_trajectory_list.copy()
-
-# if weights_per_trajectory_list.sum() > 0:
-#     wis_trajectory_level = (weights_per_trajectory_list * total_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum()
-# else:
-#     wis_trajectory_level = 0.0
-
-
-# METHOD 3:
-#
-# Weight across transitions, average across trajectories:
-#   w_j = prod_{t_i=0}^j [pi_model(a_{t_i}|s_{t_i}) / pi_clinician(a_{t_i}|s_{t_i})]
-#   R_traj = T * (sum_j w_j * R_j) / (sum_j w_j)
-#   R_WIS = (1/N) * sum_i R_traj^{(i)}
-# weights_per_trajectory_list = [] 
-# total_rewards_per_trajectory_list = []
-# weighted_rewards_per_trajectory_list = []
-
-# for patient_id in unique_patients:
-#     patient_mask = eval_patient_ids == patient_id
-#     patient_rewards = eval_rewards[patient_mask]
-#     patient_ratios = np.clip(is_weight[patient_mask], eps, None)
-#     if use_is_clipping:
-#         patient_ratios = np.clip(patient_ratios, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
-
-#     # Transition-level cumulative products: w_j = prod_{t<=j} ratio_t
-#     cumulative_weights = np.cumprod(patient_ratios)
-#     if use_is_clipping:
-#         cumulative_weights = np.clip(cumulative_weights, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
-
-#     # R_traj = T * sum_j(w_j * r_j) / sum_j(w_j)
-#     T = len(patient_rewards)
-#     if T > 0 and cumulative_weights.sum() > 0:
-#         est_total_reward_per_traj = T * (cumulative_weights * patient_rewards).sum() / cumulative_weights.sum()
-#     else:
-#         est_total_reward_per_traj = 0.0
-
-#     # Store raw trajectory return and model-estimated trajectory return
-#     total_rewards_per_trajectory_list.append(patient_rewards.sum())
-#     weighted_rewards_per_trajectory_list.append(est_total_reward_per_traj)
-
-#     # Method 3 averages across trajectories equally (not weighted across trajectories)
-#     weights_per_trajectory_list.append(1.0)
-
-# # Compute mean WIS across all trajectories
-# weights_per_trajectory_list = np.array(weights_per_trajectory_list)
-# total_rewards_per_trajectory_list = np.array(total_rewards_per_trajectory_list)
-# weighted_rewards_per_trajectory_list = np.array(weighted_rewards_per_trajectory_list)
-
-# wis_trajectory_level = weighted_rewards_per_trajectory_list.mean() if len(weighted_rewards_per_trajectory_list) > 0 else 0.0
-
-
+wis_trajectory_level = (weights_per_trajectory_list * weighted_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum()
 
 # Also compute raw clinician per-trajectory for comparison
 clinician_per_trajectory_mean = total_rewards_per_trajectory_list.mean()
@@ -752,7 +579,7 @@ for _ in range(n_bootstrap):
         bootstrap_wis = np.sum(bootstrap_weights * weighted_bootstrap_rewards) / np.sum(bootstrap_weights)
     else:
         bootstrap_wis = 0
-    
+
     bootstrap_behavior = np.mean(bootstrap_rewards)
     bootstrap_diff = bootstrap_wis - bootstrap_behavior
     bootstrap_differences.append(bootstrap_diff)
@@ -852,8 +679,8 @@ print(f"\n(ii) Weight distribution histograms saved to: {hist_path}")
 # --- Summary diagnostics table (LaTeX) ---
 diagnostics_latex = r"""\begin{table}[h]
 \centering
-\caption{Importance Sampling Diagnostics (%s)}
-\label{tab:is_diagnostics_%s}
+\caption{Importance Sampling Diagnostics - SQIL (%s)}
+\label{tab:is_diagnostics_sqil_%s}
 \begin{tabular}{lcc}
 \hline
 \textbf{Diagnostic} & \textbf{Per-Transition} & \textbf{Per-Trajectory} \\

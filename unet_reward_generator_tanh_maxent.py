@@ -50,6 +50,9 @@ class Config:
     # Paths
     experiment_dir: str = "experiments/unet_reward_gen_fixed_32"
 
+    # max ent temperature 
+    temperature: float = 1.0 
+
     def __init__(self, **kwargs):
         for key, value in kwargs.items():
             if hasattr(self, key):
@@ -456,7 +459,7 @@ def train(config: Config, data_pipeline):
         print(f"Epoch {epoch+1}/{config.num_epochs} complete")
 
         # Save model each epoch
-        save_path = os.path.join(config.experiment_dir, f"model_epoch_{epoch+1}.pt")
+        save_path = os.path.join(config.experiment_dir, f"unet_maxent_model_epoch_{epoch+1}.pt")
         save_model(model, config, save_path)
 
     print("Training complete!")
@@ -534,6 +537,7 @@ def main():
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
     parser.add_argument('--vp1_bins', type=int, default=2, help='VP1 bins')
     parser.add_argument('--vp2_bins', type=int, default=5, help='VP2 bins')
+    parser.add_argument('--temperature', type=float, default=1.0, help='max ent temperature')
     parser.add_argument('--experiment_dir', type=str, default='experiments/unet_reward_gen',
                        help='Directory to save models')
     parser.add_argument('--combined_or_train_data_path', type=str, default=None,
@@ -555,6 +559,7 @@ def main():
         vp1_bins=args.vp1_bins,
         vp2_bins=args.vp2_bins,
         experiment_dir=args.experiment_dir+'_'+str(args.conv_h_dim)+'_tanh',
+        temperature=args.temperature,
     )
 
     print(f"Config: epochs={config.num_epochs}, batch_size={config.batch_size}, "
