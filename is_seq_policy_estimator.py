@@ -390,3 +390,92 @@ print(f"  Difference:              {wis_estimate - clinician_mean:.4f}")
 print(f"\nIS weight statistics:")
 print(f"  Mean: {traj_weights.mean():.4f}, Std: {traj_weights.std():.4f}")
 print(f"  Min: {traj_weights.min():.4f}, Max: {traj_weights.max():.4f}")
+
+# =============================================================================
+# IMPORTANCE SAMPLING DIAGNOSTICS
+# (i)   Effective Sample Size (ESS) as fraction of total N
+# (ii)  Histograms of normalized importance weight distributions
+# (iii) Maximum weight ratio  max_j w_j / sum_j w_j
+# References: Thomas et al. (2015); Precup et al. (2000)
+# =============================================================================
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+# Create latex directory
+os.makedirs('latex', exist_ok=True)
+
+# Extract model name from checkpoint path for output file naming
+model_name = os.path.splitext(os.path.basename(model_path))[0]
+
+print("\n" + "="*70)
+print(f"IMPORTANCE SAMPLING DIAGNOSTICS (model: {model_name})")
+print("="*70)
+
+# --- (i) Effective Sample Size ---
+# Kish's ESS = (sum w_i)^2 / sum(w_i^2)
+ess_trajectory = traj_weights.sum()**2 / (traj_weights**2).sum()
+ess_trajectory_frac = ess_trajectory / len(traj_weights)
+
+print(f"\n(i) Effective Sample Size (ESS):")
+print(f"  Per-trajectory level:")
+print(f"    ESS:            {ess_trajectory:.2f}")
+print(f"    Total N:        {len(traj_weights)}")
+print(f"    ESS / N:        {ess_trajectory_frac:.4f} ({ess_trajectory_frac*100:.2f}%)")
+
+# --- (iii) Maximum Weight Ratio ---
+max_weight_ratio_trajectory = traj_weights.max() / traj_weights.sum()
+
+print(f"\n(iii) Maximum Weight Ratio (single-sample dominance):")
+print(f"  Per-trajectory:   max(w)/sum(w) = {max_weight_ratio_trajectory:.6f} ({max_weight_ratio_trajectory*100:.4f}%)")
+
+# --- (ii) Histogram of Normalized Importance Weight Distribution ---
+norm_weights_trajectory = traj_weights / traj_weights.sum()
+
+fig, ax = plt.subplots(1, 1, figsize=(7, 5))
+
+ax.hist(norm_weights_trajectory, bins=50, edgecolor='black', alpha=0.7, color='orange')
+ax.axvline(1.0 / len(norm_weights_trajectory), color='red', linestyle='--',
+           label=f'Uniform = {1.0/len(norm_weights_trajectory):.2e}')
+ax.set_xlabel('Normalized IS Weight')
+ax.set_ylabel('Count')
+ax.set_title(f'Per-Trajectory Normalized Weights (Seq Policy Estimator)\n'
+             f'ESS/N={ess_trajectory_frac:.4f}, '
+             f'max(w)/sum(w)={max_weight_ratio_trajectory:.4e}')
+ax.legend()
+ax.set_yscale('log')
+
+plt.tight_layout()
+hist_path = f'latex/is_weight_histograms_seq_{model_name}.png'
+plt.savefig(hist_path, dpi=150, bbox_inches='tight')
+plt.close()
+print(f"\n(ii) Weight distribution histogram saved to: {hist_path}")
+
+# --- Summary diagnostics table (LaTeX) ---
+diagnostics_latex = r"""\begin{table}[h]
+\centering
+\caption{Importance Sampling Diagnostics - Seq Policy Estimator (%s)}
+\label{tab:is_diagnostics_seq_%s}
+\begin{tabular}{lc}
+\hline
+\textbf{Diagnostic} & \textbf{Per-Trajectory} \\
+\hline
+Effective Sample Size (ESS) & %.2f \\
+Total $N$ & %d \\
+ESS / $N$ & %.4f \\
+Max weight ratio $\max_j w_j / \sum_j w_j$ & %.6f \\
+\hline
+\end{tabular}
+\end{table}
+""" % (
+    model_name.replace('_', r'\_'), model_name,
+    ess_trajectory,
+    len(traj_weights),
+    ess_trajectory_frac,
+    max_weight_ratio_trajectory
+)
+
+diagnostics_latex_file = f'latex/is_diagnostics_seq_{model_name}.tex'
+with open(diagnostics_latex_file, 'w') as f:
+    f.write(diagnostics_latex)
+print(f"Diagnostics LaTeX table saved to: {diagnostics_latex_file}")
