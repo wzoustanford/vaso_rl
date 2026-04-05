@@ -377,6 +377,16 @@ for pid in unique_patients:
 traj_weights = np.array(traj_weights)
 traj_rewards = np.array(traj_rewards)
 
+# Clip trajectory-level IS weights
+if use_is_clipping:
+    clip_lower = np.percentile(traj_weights, args.is_clip_lower_pct)
+    clip_upper = np.percentile(traj_weights, args.is_clip_upper_pct)
+    traj_weights = np.clip(traj_weights, a_min=clip_lower, a_max=clip_upper)
+    print(f"  IS clipping enabled with percentiles [{args.is_clip_lower_pct}, {args.is_clip_upper_pct}]")
+    print(f"  IS clipping bounds: [{clip_lower:.6f}, {clip_upper:.6f}]")
+else:
+    print("  IS clipping disabled")
+
 # WIS estimate: sum(w * R) / sum(w)
 wis_estimate = (traj_weights * traj_rewards).sum() / (traj_weights.sum() + eps)
 clinician_mean = traj_rewards.mean()
