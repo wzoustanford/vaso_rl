@@ -1,12 +1,13 @@
 """
 Integrated data pipeline V3 with LEARNED reward functions
-Loads reward models from MaxEnt IRL, GCL, IQ-Learn, or U-Net to replace manual reward design.
+Loads reward models from MaxEnt IRL, GCL, IQ-Learn, AIRL, or U-Net to replace manual reward design.
 
 Produces (s, a, r, s', done, patient_id) tuples for CQL training
 where r comes from a learned reward/cost function.
 """
 
 import numpy as np
+import pickle
 import torch
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional, Union
@@ -127,6 +128,7 @@ class IntegratedDataPipelineV3:
     - GCL: reward = -cost_f(s, a)
     - IQ-Learn: reward = Q(s,a) - gamma*V(s')
     - MaxEnt IRL: reward = reward_network(s, a)
+    - AIRL: reward = learned reward net prediction r(s, a, s', done)
     - U-Net: reward = per-timestep reward from U-Net reward generator
     """
 
@@ -211,8 +213,17 @@ class IntegratedDataPipelineV3:
 
         # Learned reward model (loaded separately)
         self.reward_model = None
-        self.reward_model_type = None  # 'gcl', 'iq_learn', 'maxent', or 'unet'
+        self.reward_model_type = None  # 'gcl', 'iq_learn', 'maxent', 'airl', 'unet', or 'semi_supervised_unet'
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # AIRL checkpoint metadata (set in load_airl_reward_model)
+        self.airl_state_cols = None
+        self.airl_action_cols = None
+        self.airl_state_mean = None
+        self.airl_state_std = None
+        self.airl_action_mean = None
+        self.airl_action_std = None
+        self._active_state_features = None
 
         # U-Net specific parameters (set when loading U-Net model)
         # TODO: Future improvement - read these from the model checkpoint directly
@@ -232,6 +243,26 @@ class IntegratedDataPipelineV3:
 
         # Random number generators
         self.rng = np.random.RandomState(random_seed)
+
+    def _load_checkpoint(self, checkpoint_path: str):
+        """
+        Load a checkpoint with compatibility for PyTorch 2.6+.
+        """
+        try:
+            return torch.load(checkpoint_path, map_location=self.device)
+        except pickle.UnpicklingError as exc:
+            if "Weights only load failed" not in str(exc):
+                raise
+
+            print(
+                "Checkpoint blocked by PyTorch weights_only=True default; "
+                "retrying with weights_only=False for trusted local checkpoint."
+            )
+            return torch.load(
+                checkpoint_path,
+                map_location=self.device,
+                weights_only=False,
+            )
 
     def load_gcl_reward_model(self, checkpoint_path: str):
         """
@@ -281,7 +312,7 @@ class IntegratedDataPipelineV3:
         # Lazy import to avoid circular dependency
         from maxent_irl_full_recovery import RewardNetwork
 
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = self._load_checkpoint(checkpoint_path)
 
         state_dim = checkpoint['state_dim']
         action_dim = checkpoint['action_dim']
@@ -300,6 +331,68 @@ class IntegratedDataPipelineV3:
         print(f"Loaded MaxEnt IRL reward model from: {checkpoint_path}")
         print(f"  Reward = R(s, a)")
 
+    def load_airl_reward_model(self, checkpoint_path: str):
+        """
+        Load AIRL reward network checkpoint for reward computation.
+        The checkpoint is produced by airl.py and includes:
+          - reward_net_state_dict
+          - state/action feature names
+          - state/action normalization stats used during AIRL training
+
+        Args:
+            checkpoint_path: Path to AIRL checkpoint (.pt file)
+        """
+        import gymnasium as gym
+        from imitation.rewards.reward_nets import BasicShapedRewardNet
+        from imitation.util.networks import RunningNorm
+
+        checkpoint = self._load_checkpoint(checkpoint_path)
+        required = [
+            'reward_net_state_dict', 'state_dim', 'action_dim',
+            'state_mean', 'state_std', 'action_mean', 'action_std'
+        ]
+        missing = [k for k in required if k not in checkpoint]
+        if missing:
+            raise ValueError(
+                f"Invalid AIRL checkpoint: missing keys {missing}. "
+                "Re-train/save using updated airl.py."
+            )
+
+        state_dim = int(checkpoint['state_dim'])
+        action_dim = int(checkpoint['action_dim'])
+
+        obs_space = gym.spaces.Box(
+            low=-10.0, high=10.0, shape=(state_dim,), dtype=np.float32
+        )
+        action_space = gym.spaces.Box(
+            low=-5.0, high=5.0, shape=(action_dim,), dtype=np.float32
+        )
+
+        reward_net = BasicShapedRewardNet(
+            observation_space=obs_space,
+            action_space=action_space,
+            normalize_input_layer=RunningNorm,
+        ).to(self.device)
+        reward_net.load_state_dict(checkpoint['reward_net_state_dict'])
+        reward_net.eval()
+
+        self.reward_model = reward_net
+        self.reward_model_type = 'airl'
+
+        self.airl_state_cols = checkpoint.get('state_cols', None)
+        self.airl_action_cols = checkpoint.get('action_cols', None)
+        self.airl_state_mean = np.asarray(checkpoint['state_mean'], dtype=np.float32)
+        self.airl_state_std = np.asarray(checkpoint['state_std'], dtype=np.float32)
+        self.airl_action_mean = np.asarray(checkpoint['action_mean'], dtype=np.float32)
+        self.airl_action_std = np.asarray(checkpoint['action_std'], dtype=np.float32)
+
+        print(f"Loaded AIRL reward model from: {checkpoint_path}")
+        print(f"  Reward = AIRL reward_net(s, a, s', done)")
+        if self.airl_state_cols is not None:
+            print(f"  AIRL state columns: {len(self.airl_state_cols)}")
+        if self.airl_action_cols is not None:
+            print(f"  AIRL action columns: {self.airl_action_cols}")
+
     def load_unet_reward_model(self, checkpoint_path: str, vp1_bins: int = 2, vp2_bins: int = 5):
         """
         Load U-Net model for reward computation.
@@ -315,7 +408,7 @@ class IntegratedDataPipelineV3:
         """
         from unet_reward_generator_tanh import UNetRewardGenerator
 
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = self._load_checkpoint(checkpoint_path)
 
         # Get model parameters from checkpoint
         state_size = checkpoint.get('state_size')
@@ -453,7 +546,7 @@ class IntegratedDataPipelineV3:
         """
         from semi_supervised_unet_reward_generator import UNetRewardGenerator
 
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = self._load_checkpoint(checkpoint_path)
 
         # Get model parameters from checkpoint
         state_size = checkpoint.get('state_size')
@@ -604,10 +697,111 @@ class IntegratedDataPipelineV3:
                 # MaxEnt IRL: reward = R(s,a)
                 rewards = self.reward_model(states_t, actions_t).cpu().numpy()
 
+            elif self.reward_model_type == 'airl':
+                # AIRL: reward predicted by discriminator reward network
+                rewards = self._compute_airl_reward(states, actions, next_states, dones)
+
             else:
                 raise ValueError(f"Unknown reward model type: {self.reward_model_type}")
 
         return rewards
+
+    def _compute_airl_reward(
+        self,
+        states: np.ndarray,
+        actions: np.ndarray,
+        next_states: np.ndarray,
+        dones: np.ndarray
+    ) -> np.ndarray:
+        """
+        Compute AIRL rewards while reconciling:
+          - state feature ordering differences
+          - action schema differences
+          - normalization differences (pipeline scaler vs AIRL stats)
+        """
+        if self.scaler is None:
+            raise ValueError("Scaler is not initialized; call prepare_data() first.")
+        if self._active_state_features is None:
+            raise ValueError("Active state features not set for AIRL reward computation.")
+
+        # Pipeline states are normalized with pipeline scaler -> invert back to raw space.
+        states_raw = self.scaler.inverse_transform(states)
+        next_states_raw = self.scaler.inverse_transform(next_states)
+
+        # Align states to AIRL training feature order.
+        if self.airl_state_cols is not None:
+            try:
+                state_indices = [self._active_state_features.index(c) for c in self.airl_state_cols]
+            except ValueError as exc:
+                raise ValueError(
+                    f"AIRL state feature mismatch. AIRL expects {self.airl_state_cols}, "
+                    f"but pipeline has {self._active_state_features}."
+                ) from exc
+            states_airl_raw = states_raw[:, state_indices]
+            next_states_airl_raw = next_states_raw[:, state_indices]
+        else:
+            # Backward-compatible fallback for checkpoints without explicit columns.
+            states_airl_raw = states_raw
+            next_states_airl_raw = next_states_raw
+
+        # Build AIRL action vectors from pipeline actions (+ optional state-derived columns).
+        if self.airl_action_cols is None:
+            actions_airl_raw = actions
+        else:
+            action_parts = []
+            for action_col in self.airl_action_cols:
+                if action_col == 'action_vaso':
+                    action_parts.append(actions[:, 0:1])
+                elif action_col == 'norepinephrine':
+                    if actions.shape[1] < 2:
+                        raise ValueError("Pipeline actions do not include norepinephrine column.")
+                    action_parts.append(actions[:, 1:2])
+                elif action_col in self._active_state_features:
+                    idx = self._active_state_features.index(action_col)
+                    action_parts.append(states_raw[:, idx:idx+1])
+                else:
+                    raise ValueError(
+                        f"Unsupported AIRL action column '{action_col}'. "
+                        "Use action_vaso/norepinephrine or a state feature name."
+                    )
+            actions_airl_raw = np.concatenate(action_parts, axis=1).astype(np.float32)
+
+        # Normalize using AIRL training statistics.
+        states_airl = (states_airl_raw - self.airl_state_mean) / (self.airl_state_std + 1e-8)
+        next_states_airl = (next_states_airl_raw - self.airl_state_mean) / (self.airl_state_std + 1e-8)
+        actions_airl = (actions_airl_raw - self.airl_action_mean) / (self.airl_action_std + 1e-8)
+
+        states_airl = states_airl.astype(np.float32)
+        actions_airl = actions_airl.astype(np.float32)
+        next_states_airl = next_states_airl.astype(np.float32)
+        dones_airl = dones.astype(np.float32)
+
+        # Handle API variation across imitation versions.
+        if hasattr(self.reward_model, 'predict_processed'):
+            rewards = self.reward_model.predict_processed(
+                states_airl, actions_airl, next_states_airl, dones_airl
+            )
+            return np.asarray(rewards, dtype=np.float32).reshape(-1)
+
+        if hasattr(self.reward_model, 'predict'):
+            try:
+                rewards = self.reward_model.predict(
+                    states_airl, actions_airl, next_states_airl, dones_airl
+                )
+            except TypeError:
+                rewards = self.reward_model.predict(states_airl, actions_airl)
+            return np.asarray(rewards, dtype=np.float32).reshape(-1)
+
+        with torch.no_grad():
+            s_t = torch.as_tensor(states_airl, dtype=torch.float32, device=self.device)
+            a_t = torch.as_tensor(actions_airl, dtype=torch.float32, device=self.device)
+            ns_t = torch.as_tensor(next_states_airl, dtype=torch.float32, device=self.device)
+            d_t = torch.as_tensor(dones_airl, dtype=torch.float32, device=self.device)
+            try:
+                rewards_t = self.reward_model(s_t, a_t, ns_t, d_t)
+            except TypeError:
+                rewards_t = self.reward_model(s_t, a_t)
+        return rewards_t.detach().cpu().numpy().astype(np.float32).reshape(-1)
 
     def prepare_data(self):
         """
@@ -852,6 +1046,9 @@ class IntegratedDataPipelineV3:
         ]:
             if data is None:
                 continue
+
+            # Needed by AIRL reward adapter to align feature names.
+            self._active_state_features = data.get('state_features')
 
             n_transitions = data['n_transitions']
 

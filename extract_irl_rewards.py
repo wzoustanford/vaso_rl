@@ -9,6 +9,7 @@ Models supported:
 3. Maximum Entropy IRL
 4. Guided Cost Learning (GCL)
 5. IQ-Learn
+6. AIRL
 
 Output: Dictionary with trajectory-indexed rewards saved as pickle.
 
@@ -47,8 +48,9 @@ MODEL_PATHS = {
     'unet_tanh': 'experiments/unet_reward_gen_h64_tanh/model_epoch_100.pt',
     'semi_sup_unet': 'experiments/semi_supervised_unet_64/model_epoch_100.pt',
     'maxent_irl': 'experiment/irl/maxent_reward_model.pt',
-    'gcl': '/scratch/zouwil/code/vaso_rl/experiment/irl/gcl_tau0.005_lr0.001_clr0.01_cost_model.pt',
-    'iq_learn': '/scratch/zouwil/code/vaso_rl/experiment/irl/iq_learn_temp0.001_tau0.005_lr0.001_divjs_q_model.pt',
+    'gcl': '/scratch/code/vaso_rl/experiment/irl/gcl_tau0.005_lr0.001_clr0.01_cost_model.pt',
+    'iq_learn': '/scratch/code/vaso_rl/experiment/irl/iq_learn_temp0.001_tau0.005_lr0.001_divjs_q_model.pt',
+    'airl': 'experiment/airl/airl_reward_model.pt',
 }
 
 # Output directory
@@ -403,6 +405,145 @@ def extract_iq_learn_rewards(
 
 
 # ============================================================================
+# AIRL Reward Extraction
+# ============================================================================
+
+def extract_airl_rewards(
+    model_path: str,
+    trajectories: Dict[int, Dict],
+    device: torch.device,
+    state_features: List[str],
+    scaler
+) -> Dict[int, List[float]]:
+    """
+    Extract rewards from AIRL checkpoint produced by airl.py.
+    Reconciles feature order/action schema/normalization with pipeline data.
+    """
+    print(f"\n{'='*60}")
+    print("Loading AIRL Model")
+    print(f"{'='*60}")
+
+    if not os.path.exists(model_path):
+        print(f"  WARNING: Model not found at {model_path}")
+        return None
+
+    try:
+        import gymnasium as gym
+        from imitation.rewards.reward_nets import BasicShapedRewardNet
+        from imitation.util.networks import RunningNorm
+    except Exception as exc:
+        print(f"  WARNING: AIRL dependencies unavailable ({exc}). Skipping AIRL extraction.")
+        return None
+
+    checkpoint = torch.load(model_path, map_location=device)
+    required = [
+        'reward_net_state_dict', 'state_dim', 'action_dim',
+        'state_mean', 'state_std', 'action_mean', 'action_std'
+    ]
+    missing = [k for k in required if k not in checkpoint]
+    if missing:
+        print(f"  WARNING: Invalid AIRL checkpoint missing keys {missing}")
+        return None
+
+    state_dim = int(checkpoint['state_dim'])
+    action_dim = int(checkpoint['action_dim'])
+
+    obs_space = gym.spaces.Box(low=-10.0, high=10.0, shape=(state_dim,), dtype=np.float32)
+    action_space = gym.spaces.Box(low=-5.0, high=5.0, shape=(action_dim,), dtype=np.float32)
+    model = BasicShapedRewardNet(
+        observation_space=obs_space,
+        action_space=action_space,
+        normalize_input_layer=RunningNorm,
+    ).to(device)
+    model.load_state_dict(checkpoint['reward_net_state_dict'])
+    model.eval()
+
+    airl_state_cols = checkpoint.get('state_cols', None)
+    airl_action_cols = checkpoint.get('action_cols', None)
+    state_mean = np.asarray(checkpoint['state_mean'], dtype=np.float32)
+    state_std = np.asarray(checkpoint['state_std'], dtype=np.float32)
+    action_mean = np.asarray(checkpoint['action_mean'], dtype=np.float32)
+    action_std = np.asarray(checkpoint['action_std'], dtype=np.float32)
+
+    print(f"  Loaded: state_dim={state_dim}, action_dim={action_dim}")
+    if airl_action_cols is not None:
+        print(f"  AIRL action columns: {airl_action_cols}")
+
+    rewards_dict = {}
+
+    with torch.no_grad():
+        for i, (pid, traj) in enumerate(trajectories.items()):
+            if (i + 1) % 100 == 0:
+                print(f"  Processing trajectory {i+1}/{len(trajectories)}")
+
+            # Pipeline trajectories are normalized by pipeline scaler -> convert to raw first.
+            states_raw = scaler.inverse_transform(traj['states'])
+            next_states_raw = scaler.inverse_transform(traj['next_states'])
+
+            # State alignment
+            if airl_state_cols is not None:
+                try:
+                    idx = [state_features.index(c) for c in airl_state_cols]
+                except ValueError:
+                    print("  WARNING: AIRL state features mismatch with pipeline. Skipping AIRL extraction.")
+                    return None
+                states_airl_raw = states_raw[:, idx]
+                next_states_airl_raw = next_states_raw[:, idx]
+            else:
+                states_airl_raw = states_raw
+                next_states_airl_raw = next_states_raw
+
+            # Action alignment
+            actions = traj['actions']
+            if airl_action_cols is None:
+                actions_airl_raw = actions
+            else:
+                action_parts = []
+                for action_col in airl_action_cols:
+                    if action_col == 'action_vaso':
+                        action_parts.append(actions[:, 0:1])
+                    elif action_col == 'norepinephrine':
+                        if actions.shape[1] < 2:
+                            print("  WARNING: AIRL expects norepinephrine action but actions are not dual.")
+                            return None
+                        action_parts.append(actions[:, 1:2])
+                    elif action_col in state_features:
+                        sidx = state_features.index(action_col)
+                        action_parts.append(states_raw[:, sidx:sidx+1])
+                    else:
+                        print(f"  WARNING: Unsupported AIRL action column '{action_col}'")
+                        return None
+                actions_airl_raw = np.concatenate(action_parts, axis=1).astype(np.float32)
+
+            states_airl = ((states_airl_raw - state_mean) / (state_std + 1e-8)).astype(np.float32)
+            next_states_airl = ((next_states_airl_raw - state_mean) / (state_std + 1e-8)).astype(np.float32)
+            actions_airl = ((actions_airl_raw - action_mean) / (action_std + 1e-8)).astype(np.float32)
+            dones_airl = traj['dones'].astype(np.float32)
+
+            if hasattr(model, 'predict_processed'):
+                rewards_pred = model.predict_processed(states_airl, actions_airl, next_states_airl, dones_airl)
+            elif hasattr(model, 'predict'):
+                try:
+                    rewards_pred = model.predict(states_airl, actions_airl, next_states_airl, dones_airl)
+                except TypeError:
+                    rewards_pred = model.predict(states_airl, actions_airl)
+            else:
+                s_t = torch.as_tensor(states_airl, dtype=torch.float32, device=device)
+                a_t = torch.as_tensor(actions_airl, dtype=torch.float32, device=device)
+                ns_t = torch.as_tensor(next_states_airl, dtype=torch.float32, device=device)
+                d_t = torch.as_tensor(dones_airl, dtype=torch.float32, device=device)
+                try:
+                    rewards_pred = model(s_t, a_t, ns_t, d_t).detach().cpu().numpy()
+                except TypeError:
+                    rewards_pred = model(s_t, a_t).detach().cpu().numpy()
+
+            rewards_dict[pid] = np.asarray(rewards_pred, dtype=np.float32).reshape(-1).tolist()
+
+    print(f"  Extracted rewards for {len(rewards_dict)} trajectories")
+    return rewards_dict
+
+
+# ============================================================================
 # Clinician Reward Extraction
 # ============================================================================
 
@@ -452,7 +593,9 @@ def save_rewards_pickle(
 def extract_rewards_for_dataset(
     trajectories: Dict[int, Dict],
     device: torch.device,
-    dataset_name: str = "test"
+    dataset_name: str = "test",
+    state_features: Optional[List[str]] = None,
+    scaler=None
 ) -> Dict:
     """Extract rewards from all IRL models for a given dataset."""
 
@@ -498,6 +641,16 @@ def extract_rewards_for_dataset(
     )
     if iq_learn_rewards is not None:
         all_rewards['iq_learn'] = iq_learn_rewards
+
+    # 7. AIRL
+    if state_features is None or scaler is None:
+        print("  WARNING: Missing state_features/scaler; skipping AIRL reward extraction.")
+    else:
+        airl_rewards = extract_airl_rewards(
+            MODEL_PATHS['airl'], trajectories, device, state_features, scaler
+        )
+        if airl_rewards is not None:
+            all_rewards['airl'] = airl_rewards
 
     return all_rewards
 
@@ -556,7 +709,13 @@ def main(include_val: bool = False):
     print(f"\n{'='*60}")
     print("Extracting TEST Set Rewards")
     print(f"{'='*60}")
-    test_rewards = extract_rewards_for_dataset(test_trajectories, device, "test")
+    test_rewards = extract_rewards_for_dataset(
+        test_trajectories,
+        device,
+        "test",
+        state_features=test_data.get('state_features'),
+        scaler=pipeline.scaler,
+    )
 
     # Extract validation rewards if requested
     val_rewards = None
@@ -564,7 +723,13 @@ def main(include_val: bool = False):
         print(f"\n{'='*60}")
         print("Extracting VALIDATION Set Rewards")
         print(f"{'='*60}")
-        val_rewards = extract_rewards_for_dataset(val_trajectories, device, "val")
+        val_rewards = extract_rewards_for_dataset(
+            val_trajectories,
+            device,
+            "val",
+            state_features=val_data.get('state_features'),
+            scaler=pipeline.scaler,
+        )
 
     # =========================================================================
     # Build combined rewards structure
@@ -604,7 +769,7 @@ def main(include_val: bool = False):
         }
 
         # Merge rewards for each model
-        for model_name in ['clinician', 'unet_tanh', 'semi_sup_unet', 'maxent_irl', 'gcl', 'iq_learn']:
+        for model_name in ['clinician', 'unet_tanh', 'semi_sup_unet', 'maxent_irl', 'gcl', 'iq_learn', 'airl']:
             if model_name in test_rewards and model_name in val_rewards:
                 combined_rewards[model_name] = {**test_rewards[model_name], **val_rewards[model_name]}
             elif model_name in test_rewards:
@@ -635,7 +800,7 @@ def main(include_val: bool = False):
         )
 
     # Save individual files for each model (test only)
-    for model_name in ['clinician', 'unet_tanh', 'semi_sup_unet', 'maxent_irl', 'gcl', 'iq_learn']:
+    for model_name in ['clinician', 'unet_tanh', 'semi_sup_unet', 'maxent_irl', 'gcl', 'iq_learn', 'airl']:
         if model_name in test_rewards:
             individual_data = {
                 'metadata': test_all_rewards['metadata'],
@@ -656,7 +821,7 @@ def main(include_val: bool = False):
     print("EXTRACTION COMPLETE")
     print(f"{'='*60}")
     print(f"\nTEST set models extracted:")
-    for model_name in ['clinician', 'unet_tanh', 'semi_sup_unet', 'maxent_irl', 'gcl', 'iq_learn']:
+    for model_name in ['clinician', 'unet_tanh', 'semi_sup_unet', 'maxent_irl', 'gcl', 'iq_learn', 'airl']:
         if model_name in test_rewards:
             n_traj = len(test_rewards[model_name])
             total_rewards = sum(len(r) for r in test_rewards[model_name].values())
@@ -666,7 +831,7 @@ def main(include_val: bool = False):
 
     if combined_rewards is not None:
         print(f"\nCOMBINED (val+test) models extracted:")
-        for model_name in ['clinician', 'unet_tanh', 'semi_sup_unet', 'maxent_irl', 'gcl', 'iq_learn']:
+        for model_name in ['clinician', 'unet_tanh', 'semi_sup_unet', 'maxent_irl', 'gcl', 'iq_learn', 'airl']:
             if model_name in combined_rewards:
                 n_traj = len(combined_rewards[model_name])
                 total_rewards = sum(len(r) for r in combined_rewards[model_name].values())

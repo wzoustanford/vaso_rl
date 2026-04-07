@@ -2,12 +2,15 @@
 # Experiment pipeline for IRL reward learning + Q-Learning + WIS evaluation
 # Usage: ./run_experiment.sh <algorithm> [options]
 #
-# Algorithms: manual, maxent, gcl, iq_learn, unet, semi_supervised_unet
+# Algorithms: manual, maxent, gcl, iq_learn, airl, unet, semi_supervised_unet
 #
 # Examples:
 #   ./run_experiment.sh gcl --test
 #   ./run_experiment.sh maxent --irl_epochs 50 --ql_epochs 100
 #   ./run_experiment.sh iq_learn --iq_init_temp 0.01 --iq_tau 0.01 --iq_lr 1e-3 --iq_div chi
+#   ./run_experiment.sh airl --airl_steps 200000 --airl_dyn_epochs 10
+#   ./run_experiment.sh airl --wis_reward_type manual   # Fixed clinician baseline across methods
+#   ./run_experiment.sh airl --wis_reward_type irl      # Evaluate on learned AIRL reward scale
 #   ./run_experiment.sh unet --unet_epochs 100 --unet_conv_h_dim 16
 #   ./run_experiment.sh unet --skip_irl --irl_model_path experiments/unet/model_epoch_100.pt
 #   ./run_experiment.sh unet --unet_ablation causal  # Run with causal ablation
@@ -62,6 +65,10 @@ SKIP_IRL=false
 # IRL model vp2_bins (for loading pre-trained models with different vp2_bins)
 IRL_VP2_BINS=""  # Empty means use same as VP2_BINS
 
+# AIRL-specific defaults
+AIRL_STEPS=200000
+AIRL_DYN_EPOCHS=10
+
 # LSTM Q-learning defaults
 USE_LSTM=false
 LSTM_SEQ_LEN=5
@@ -75,6 +82,9 @@ LSTM_BATCH_SIZE=32
 
 # Reward combination defaults
 REWARD_COMBINE_LAMBDA=""  # Empty means pure IRL reward
+
+# WIS evaluation reward defaults
+WIS_REWARD_TYPE="manual"  # 'manual' or 'irl'
 
 # Dataset configuration defaults
 COMBINED_OR_TRAIN_DATA_PATH=""  # Empty means use default config.DATA_PATH
@@ -91,6 +101,8 @@ while [[ $# -gt 0 ]]; do
             TEST_MODE=true
             IRL_EPOCHS=2
             QL_EPOCHS=2
+            AIRL_STEPS=1000
+            AIRL_DYN_EPOCHS=2
             SUFFIX="_test"
             shift
             ;;
@@ -175,8 +187,24 @@ while [[ $# -gt 0 ]]; do
             IRL_VP2_BINS="$2"
             shift 2
             ;;
+        --airl_steps)
+            AIRL_STEPS="$2"
+            shift 2
+            ;;
+        --airl_dyn_epochs)
+            AIRL_DYN_EPOCHS="$2"
+            shift 2
+            ;;
         --reward_combine_lambda)
             REWARD_COMBINE_LAMBDA="$2"
+            shift 2
+            ;;
+        --wis_reward_type)
+            WIS_REWARD_TYPE="$2"
+            if [[ "$WIS_REWARD_TYPE" != "manual" && "$WIS_REWARD_TYPE" != "irl" ]]; then
+                echo "Error: --wis_reward_type must be 'manual' or 'irl'"
+                exit 1
+            fi
             shift 2
             ;;
         --combined_or_train_data_path)
@@ -255,6 +283,10 @@ if [ "$ALGORITHM" == "iq_learn" ]; then
     echo "IQ lr: $IQ_LR"
     echo "IQ div: $IQ_DIV"
 fi
+if [ "$ALGORITHM" == "airl" ]; then
+    echo "AIRL steps: $AIRL_STEPS"
+    echo "AIRL dynamics epochs: $AIRL_DYN_EPOCHS"
+fi
 if [ "$ALGORITHM" == "unet" ] || [ "$ALGORITHM" == "semi_supervised_unet" ]; then
     echo "U-Net epochs: $UNET_EPOCHS"
     echo "U-Net conv_h_dim: $UNET_CONV_H_DIM"
@@ -278,6 +310,7 @@ if [ -n "$REWARD_COMBINE_LAMBDA" ]; then
     echo "Reward combine lambda: $REWARD_COMBINE_LAMBDA"
     echo "  Combined reward = (1-lambda)*manual + lambda*IRL"
 fi
+echo "WIS reward type: $WIS_REWARD_TYPE"
 if [ -n "$EVAL_DATA_PATH" ]; then
     echo "Dataset mode: DUAL-DATASET"
     echo "  Train data: ${COMBINED_OR_TRAIN_DATA_PATH:-default}"
@@ -396,6 +429,20 @@ else
             fi
             eval $IQ_CMD
             REWARD_MODEL_PATH="${IRL_DIR}/iq_learn${SUFFIX}_q_model.pt"
+            ;;
+        airl)
+            AIRL_CMD="python ${SCRIPT_DIR}/airl.py \
+                --airl_steps $AIRL_STEPS \
+                --dyn_epochs $AIRL_DYN_EPOCHS \
+                --save_dir $IRL_DIR \
+                --prefix airl${SUFFIX} \
+                --action_schema pipeline_dual \
+                --state_schema pipeline_dual"
+            if [ -n "$COMBINED_OR_TRAIN_DATA_PATH" ]; then
+                AIRL_CMD="$AIRL_CMD --csv_path $COMBINED_OR_TRAIN_DATA_PATH"
+            fi
+            eval $AIRL_CMD
+            REWARD_MODEL_PATH="${IRL_DIR}/airl${SUFFIX}_reward_model.pt"
             ;;
         unet)
             UNET_DIR="${EXPERIMENT_DIR}/unet_${SUFFIX}"
@@ -646,6 +693,16 @@ else
     WIS_CMD="python ${SCRIPT_DIR}/is_block_discrete.py \
         --model_path $QL_MODEL_PATH \
         --vp2_bins $VP2_BINS"
+
+    if [ "$WIS_REWARD_TYPE" == "irl" ]; then
+        if [ -z "$REWARD_MODEL_PATH" ]; then
+            echo "Error: --wis_reward_type irl requires an IRL reward model path"
+            exit 1
+        fi
+        WIS_CMD="$WIS_CMD --reward_type irl --irl_model_path $REWARD_MODEL_PATH"
+    else
+        WIS_CMD="$WIS_CMD --reward_type manual"
+    fi
 
     if [ -n "$COMBINED_OR_TRAIN_DATA_PATH" ]; then
         WIS_CMD="$WIS_CMD --combined_or_train_data_path $COMBINED_OR_TRAIN_DATA_PATH"

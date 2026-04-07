@@ -158,7 +158,7 @@ def train_lstm_block_discrete_cql(
         save_dir: Directory to save models
         log_dir: Directory to save logs
         log_every: Log every N epochs
-        reward_model_path: Path to learned reward model (gcl/iq_learn/maxent/unet)
+        reward_model_path: Path to learned reward model (gcl/iq_learn/maxent/airl/unet)
         suffix: Suffix to add to experiment prefix
         reward_combine_lambda: If None, use pure IRL reward. If in [0, 1], use
             (1 - lambda) * manual_reward + lambda * irl_reward.
@@ -239,6 +239,15 @@ def train_lstm_block_discrete_cql(
             eval_data_path=eval_data_path
         )
         pipeline.load_maxent_reward_model(reward_model_path)
+    elif 'airl' in reward_model_path:
+        reward_type = "airl"
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
+        )
+        pipeline.load_airl_reward_model(reward_model_path)
     elif 'semi_supervised_unet' in reward_model_path:
         reward_type = "semi_supervised_unet"
         pipeline = IntegratedDataPipelineV3(
@@ -645,7 +654,7 @@ def main():
     parser.add_argument('--grad_clip', type=float, default=1.0,
                        help='Gradient clipping value (default: 1.0)')
     parser.add_argument('--reward_model_path', type=str, default=None,
-                       help='Path to learned reward model (gcl/iq_learn/maxent/unet). None=manual reward')
+                       help='Path to learned reward model (gcl/iq_learn/maxent/airl/unet). None=manual reward')
     parser.add_argument('--suffix', type=str, default='',
                        help='Suffix to add to experiment prefix (e.g., "_test")')
     parser.add_argument('--save_dir', type=str, default='experiment/ql',
