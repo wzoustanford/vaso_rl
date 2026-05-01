@@ -474,16 +474,24 @@ def train(config: Config, data_pipeline, time_one_batch: bool = False):
 
             if time_one_batch:
                 batch_transitions = states.shape[0] * states.shape[1]
-                start = time.time()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                start = time.perf_counter()
                 loss, metrics = compute_training_step(model, states, actions, config, device)
                 loss.backward()
                 optimizer.step()
-                end = time.time()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                end = time.perf_counter()
+                batch_time = end - start
                 timing_save_path = os.path.join(config.experiment_dir, "timing_batch_model.pt")
                 save_model(model, config, timing_save_path)
                 print(f"UNET_BATCH_SHAPE={tuple(states.shape)}")
+                print(f"UNET_BATCH_SAMPLES={states.shape[0]}")
                 print(f"UNET_BATCH_TRANSITIONS={batch_transitions}")
-                print(f"UNET_BATCH_TIME_SECONDS={end - start}")
+                print(f"UNET_BATCH_TIME_SECONDS={batch_time}")
+                print(f"UNET_SECONDS_PER_SAMPLE={batch_time / states.shape[0]}")
+                print(f"UNET_SECONDS_PER_TRANSITION={batch_time / batch_transitions}")
                 print(f"UNET_TIMING_MODEL_PATH={timing_save_path}")
                 return model
 

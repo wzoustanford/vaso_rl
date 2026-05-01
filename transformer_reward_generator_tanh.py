@@ -459,10 +459,17 @@ def train(config: Config, data_pipeline, resume_model_path: str = None, time_one
     step = 0
     n_batches = len(buffer) // config.batch_size
     print(f"[DEBUG] Starting training: {config.num_epochs} epochs, {n_batches} batches per epoch")
+    if n_batches == 0:
+        raise ValueError(
+            f"Not enough sequences for batch_size={config.batch_size}: "
+            f"buffer has {len(buffer)} sequences. Use a smaller --trans_batch_size "
+            "or a dataset with more generated sequences."
+        )
 
-    for epoch in range(config.num_epochs):
+    epochs_to_run = 1 if time_one_batch else config.num_epochs
+    for epoch in range(epochs_to_run):
         absolute_epoch = start_epoch + epoch + 1
-        print(f"[DEBUG] Epoch {absolute_epoch} ({epoch+1}/{config.num_epochs} resumed-run) starting...")
+        print(f"[DEBUG] Epoch {absolute_epoch} ({epoch+1}/{epochs_to_run} resumed-run) starting...")
         model.train()
         epoch_loss = 0.0
         epoch_acc = 0.0
@@ -485,16 +492,24 @@ def train(config: Config, data_pipeline, resume_model_path: str = None, time_one
 
             if time_one_batch:
                 batch_transitions = states.shape[0] * states.shape[1]
-                start = time.time()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                start = time.perf_counter()
                 loss, metrics = compute_training_step(model, states, actions, config, device)
                 loss.backward()
                 optimizer.step()
-                end = time.time()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                end = time.perf_counter()
+                batch_time = end - start
                 timing_save_path = os.path.join(config.experiment_dir, "timing_batch_model.pt")
                 save_model(model, config, timing_save_path)
                 print(f"TRANSFORMER_BATCH_SHAPE={tuple(states.shape)}")
+                print(f"TRANSFORMER_BATCH_SAMPLES={states.shape[0]}")
                 print(f"TRANSFORMER_BATCH_TRANSITIONS={batch_transitions}")
-                print(f"TRANSFORMER_BATCH_TIME_SECONDS={end - start}")
+                print(f"TRANSFORMER_BATCH_TIME_SECONDS={batch_time}")
+                print(f"TRANSFORMER_SECONDS_PER_SAMPLE={batch_time / states.shape[0]}")
+                print(f"TRANSFORMER_SECONDS_PER_TRANSITION={batch_time / batch_transitions}")
                 print(f"TRANSFORMER_TIMING_MODEL_PATH={timing_save_path}")
                 return model
 
@@ -621,6 +636,8 @@ def main():
     parser.add_argument('--dropout', type=float, default=0.1, help='Transformer dropout')
     parser.add_argument('--D', type=int, default=10, help='Q-value horizon')
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
+    parser.add_argument('--sequence_length', type=int, default=512,
+                       help='Sequence length for trajectory windows')
     parser.add_argument('--vp1_bins', type=int, default=2, help='VP1 bins')
     parser.add_argument('--vp2_bins', type=int, default=5, help='VP2 bins')
     parser.add_argument('--experiment_dir', type=str, default='experiments/transformer_reward_gen',
@@ -649,6 +666,7 @@ def main():
         dropout=args.dropout,
         D=args.D,
         gamma=args.gamma,
+        sequence_length=args.sequence_length,
         vp1_bins=args.vp1_bins,
         vp2_bins=args.vp2_bins,
         experiment_dir=args.experiment_dir+f"_{args.d_model}d_{args.num_layers}l_tanh",

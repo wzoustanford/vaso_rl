@@ -27,6 +27,7 @@ TRANS_DROPOUT=0.1
 TRANS_D=5
 TRANS_GAMMA=0.99
 TRANS_LR=1e-4
+TRANS_SEQUENCE_LENGTH=40
 SKIP_IRL=false
 RESUME_IRL_MODEL_PATH=""
 
@@ -110,6 +111,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --trans_lr)
             TRANS_LR="$2"
+            shift 2
+            ;;
+        --trans_sequence_length)
+            TRANS_SEQUENCE_LENGTH="$2"
             shift 2
             ;;
         --skip_irl)
@@ -290,6 +295,7 @@ else
         --dropout $TRANS_DROPOUT \
         --D $TRANS_D \
         --gamma $TRANS_GAMMA \
+        --sequence_length $TRANS_SEQUENCE_LENGTH \
         --vp2_bins $VP2_BINS \
         --experiment_dir $TRANS_DIR"
 

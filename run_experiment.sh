@@ -363,7 +363,14 @@ else
             if [ -n "$EVAL_DATA_PATH" ]; then
                 MAXENT_CMD="$MAXENT_CMD --eval_data_path $EVAL_DATA_PATH"
             fi
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                MAXENT_CMD="$MAXENT_CMD --time_one_batch"
+            fi
             eval $MAXENT_CMD
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                echo "MaxEnt IRL one-batch timing complete."
+                exit 0
+            fi
             REWARD_MODEL_PATH="${IRL_DIR}/maxent${SUFFIX}_reward_model.pt"
             ;;
         gcl)
@@ -381,7 +388,14 @@ else
             if [ -n "$EVAL_DATA_PATH" ]; then
                 GCL_CMD="$GCL_CMD --eval_data_path $EVAL_DATA_PATH"
             fi
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                GCL_CMD="$GCL_CMD --time_one_batch"
+            fi
             eval $GCL_CMD
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                echo "GCL one-batch timing complete."
+                exit 0
+            fi
             REWARD_MODEL_PATH="${IRL_DIR}/gcl${SUFFIX}_cost_model.pt"
             ;;
         iq_learn)
@@ -400,7 +414,14 @@ else
             if [ -n "$EVAL_DATA_PATH" ]; then
                 IQ_CMD="$IQ_CMD --eval_data_path $EVAL_DATA_PATH"
             fi
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                IQ_CMD="$IQ_CMD --time_one_batch"
+            fi
             eval $IQ_CMD
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                echo "IQ-Learn one-batch timing complete."
+                exit 0
+            fi
             REWARD_MODEL_PATH="${IRL_DIR}/iq_learn${SUFFIX}_q_model.pt"
             ;;
         unet)
@@ -487,15 +508,26 @@ else
             if [ -n "$EVAL_DATA_PATH" ]; then
                 UNET_CMD="$UNET_CMD --eval_data_path $EVAL_DATA_PATH"
             fi
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                UNET_CMD="$UNET_CMD --time_one_batch"
+            fi
             if [ -n "$UNET_ABLATION" ]; then
                 UNET_CMD="$UNET_CMD --ablation_setting $UNET_ABLATION"
             fi
             eval $UNET_CMD
-            # Find the latest model (tanh version adds _tanh suffix)
-            REWARD_MODEL_PATH=$(ls -t "${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"/transformer_context_irl_model_epoch_*.pt 2>/dev/null | head -1)
-            if [ -z "$REWARD_MODEL_PATH" ]; then
-                echo "Error: No U-Net model found in ${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"
-                exit 1
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                REWARD_MODEL_PATH="${UNET_DIR}_${UNET_CONV_H_DIM}d_2l_tanh/timing_batch_model.pt"
+                if [ ! -f "$REWARD_MODEL_PATH" ]; then
+                    echo "Error: Expected timing-mode transformer model not found: $REWARD_MODEL_PATH"
+                    exit 1
+                fi
+            else
+                # Find the latest model (tanh version adds _tanh suffix)
+                REWARD_MODEL_PATH=$(ls -t "${UNET_DIR}_${UNET_CONV_H_DIM}d_2l_tanh"/transformer_context_irl_model_epoch_*.pt 2>/dev/null | head -1)
+                if [ -z "$REWARD_MODEL_PATH" ]; then
+                    echo "Error: No transformer model found in ${UNET_DIR}_${UNET_CONV_H_DIM}d_2l_tanh"
+                    exit 1
+                fi
             fi
             ;;
         semi_supervised_unet)

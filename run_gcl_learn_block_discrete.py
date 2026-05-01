@@ -508,7 +508,8 @@ def train_gcl(
     experiment_prefix: str = "gcl",
     save_dir: str = "experiment/gcl",
     combined_or_train_data_path: str = None,
-    eval_data_path: str = None
+    eval_data_path: str = None,
+    time_one_batch: bool = False
 ):
     """Train GCL agent for inverse RL cost/reward recovery."""
 
@@ -572,7 +573,8 @@ def train_gcl(
 
     best_val_loss = float('inf')
 
-    for epoch in range(epochs):
+    epochs_to_run = 1 if time_one_batch else epochs
+    for epoch in range(epochs_to_run):
         # Training phase
         agent.q1.train()
         agent.q2.train()
@@ -583,6 +585,11 @@ def train_gcl(
         }
 
         n_batches = len(train_data['states']) // batch_size
+        if n_batches == 0:
+            raise ValueError(
+                f"Not enough transitions for batch_size={batch_size}: "
+                f"train split has {len(train_data['states'])} transitions."
+            )
 
         for _ in range(n_batches):
             batch = pipeline.get_batch(batch_size=batch_size, split='train')
@@ -592,6 +599,24 @@ def train_gcl(
             next_states = torch.FloatTensor(batch['next_states']).to(agent.device)
             dones = torch.FloatTensor(batch['dones']).to(agent.device)
             # Note: We do NOT use batch['rewards'] - GCL learns cost/rewards implicitly
+
+            if time_one_batch:
+                batch_transitions = states.shape[0]
+                if agent.device.type == "cuda":
+                    torch.cuda.synchronize()
+                start = time.perf_counter()
+                metrics = agent.gcl_update(states, actions, next_states, dones)
+                if agent.device.type == "cuda":
+                    torch.cuda.synchronize()
+                end = time.perf_counter()
+                batch_time = end - start
+                print(f"GCL_BATCH_SHAPE={tuple(states.shape)}", flush=True)
+                print(f"GCL_BATCH_SAMPLES={states.shape[0]}", flush=True)
+                print(f"GCL_BATCH_TRANSITIONS={batch_transitions}", flush=True)
+                print(f"GCL_BATCH_TIME_SECONDS={batch_time}", flush=True)
+                print(f"GCL_SECONDS_PER_SAMPLE={batch_time / states.shape[0]}", flush=True)
+                print(f"GCL_SECONDS_PER_TRANSITION={batch_time / batch_transitions}", flush=True)
+                return agent, pipeline
 
             metrics = agent.gcl_update(states, actions, next_states, dones)
 
@@ -704,6 +729,8 @@ def main():
     parser.add_argument('--eval_data_path', type=str, default=None,
                        help='Path to evaluation dataset (for val/test). If provided, enables '
                             'dual-dataset mode where this dataset is split 50/50 into val/test.')
+    parser.add_argument('--time_one_batch', action='store_true',
+                       help='Run one GCL training update, print timing, and exit.')
 
     args = parser.parse_args()
 
@@ -727,7 +754,8 @@ def main():
         experiment_prefix=args.prefix,
         save_dir=args.save_dir,
         combined_or_train_data_path=args.combined_or_train_data_path,
-        eval_data_path=args.eval_data_path
+        eval_data_path=args.eval_data_path,
+        time_one_batch=args.time_one_batch
     )
 
     print("\n" + "=" * 70, flush=True)
