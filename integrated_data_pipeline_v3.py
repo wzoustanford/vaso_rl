@@ -989,9 +989,13 @@ class IntegratedDataPipelineV3:
         Get the reward model prefix identifier for experiment naming.
 
         Returns:
+            - If reward_source='mortality_only': 'mortality_only'
             - If reward_combine_lambda is None: just the reward_model_type (e.g., 'maxent')
             - If reward_combine_lambda is set: e.g., 'maxent_combined_manual_lambda0.1'
         """
+        if self.reward_source == 'mortality_only':
+            return 'mortality_only'
+
         if self.reward_model_type is None:
             return 'manual'
 

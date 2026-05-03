@@ -23,8 +23,8 @@ parser.add_argument('--vp2_bins', type=int, default=5,
                    help='Number of bins for VP2 discretization (default: 5)')
 parser.add_argument('--eval_set', type=str, default='test', choices=['val', 'test'],
                    help='Which data split to evaluate on (default: test)')
-parser.add_argument('--reward_type', type=str, default='manual', choices=['manual', 'irl'],
-                   help='Reward type: manual (clinician-defined) or irl (learned from IRL model)')
+parser.add_argument('--reward_type', type=str, default='manual', choices=['manual', 'irl', 'mortality_only'],
+                   help='Reward type: manual, irl, or mortality_only sparse terminal death indicator')
 parser.add_argument('--irl_model_path', type=str, default=None,
                    help='Path to IRL model for reward computation (required if reward_type=irl)')
 parser.add_argument('--combined_or_train_data_path', type=str, default=None,
@@ -148,6 +148,14 @@ if reward_type == 'irl':
         print(f"Warning: Could not detect IRL model type from path, trying IQ-Learn...")
         pipeline.load_iq_learn_reward_model(irl_model_path)
 
+    train_data, val_data, test_data = pipeline.prepare_data()
+elif reward_type == 'mortality_only':
+    # Use V3 pipeline with sparse binary terminal mortality rewards.
+    pipeline = IntegratedDataPipelineV3(
+        model_type='dual', reward_source='mortality_only', random_seed=42,
+        combined_or_train_data_path=args.combined_or_train_data_path,
+        eval_data_path=args.eval_data_path
+    )
     train_data, val_data, test_data = pipeline.prepare_data()
 else:
     # Use V3 pipeline with manual rewards (supports dual-dataset mode)
@@ -596,51 +604,51 @@ weights_per_trajectory_list = []
 total_rewards_per_trajectory_list = []
 weighted_rewards_per_trajectory_list = []
 
-for patient_id in unique_patients:
-    patient_mask = eval_patient_ids == patient_id
-    """
-    mean_model_prob = eval_prob_model[patient_mask].mean()
-    mean_clinician_prob = eval_prob_clinician[patient_mask].mean()
-    patient_rewards = eval_rewards[patient_mask]
-    traj_is_weight = mean_model_prob /(1e-8 + mean_clinician_prob)
+# for patient_id in unique_patients:
+#     patient_mask = eval_patient_ids == patient_id
+#     """
+#     mean_model_prob = eval_prob_model[patient_mask].mean()
+#     mean_clinician_prob = eval_prob_clinician[patient_mask].mean()
+#     patient_rewards = eval_rewards[patient_mask]
+#     traj_is_weight = mean_model_prob /(1e-8 + mean_clinician_prob)
 
-    if not traj_is_weight == 0:
-        #weights_per_trajectory_list.append(patient_weights.prod())
-        weights_per_trajectory_list.append(traj_is_weight)
-        total_rewards_per_trajectory_list.append(patient_rewards.sum())
-    else:
-        print("zero encountered in trajectory level multiplied weights")
-    """
+#     if not traj_is_weight == 0:
+#         #weights_per_trajectory_list.append(patient_weights.prod())
+#         weights_per_trajectory_list.append(traj_is_weight)
+#         total_rewards_per_trajectory_list.append(patient_rewards.sum())
+#     else:
+#         print("zero encountered in trajectory level multiplied weights")
+#     """
 
-    # Get weights and rewards for this trajectory
-    patient_weights = is_weight[patient_mask]
-    patient_rewards = eval_rewards[patient_mask]
-    weights_per_trajectory_list.append(patient_weights.mean())
+#     # Get weights and rewards for this trajectory
+#     patient_weights = is_weight[patient_mask]
+#     patient_rewards = eval_rewards[patient_mask]
+#     weights_per_trajectory_list.append(patient_weights.mean())
 
-    patient_weights = np.cumprod(patient_weights)
-    if use_is_clipping:
-        patient_weights = np.clip(patient_weights, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+#     patient_weights = np.cumprod(patient_weights)
+#     if use_is_clipping:
+#         patient_weights = np.clip(patient_weights, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
     
-    # np.clip(is_weight, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
-    est_total_reward_per_traj = (patient_weights *  patient_rewards).sum() / patient_weights.sum() * len(patient_weights)
+#     # np.clip(is_weight, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
+#     est_total_reward_per_traj = (patient_weights *  patient_rewards).sum() / patient_weights.sum() * len(patient_weights)
 
-    total_rewards_per_trajectory_list.append(patient_rewards.sum())
-    weighted_rewards_per_trajectory_list.append(est_total_reward_per_traj)
+#     total_rewards_per_trajectory_list.append(patient_rewards.sum())
+#     weighted_rewards_per_trajectory_list.append(est_total_reward_per_traj)
     
 
-#wisw_ci_diff_lower = np.percentile(weights_per_trajectory_list, 5)
-#wisw_ci_diff_upper = np.percentile(weights_per_trajectory_list, 95)
+# #wisw_ci_diff_lower = np.percentile(weights_per_trajectory_list, 5)
+# #wisw_ci_diff_upper = np.percentile(weights_per_trajectory_list, 95)
 
-#weights_per_trajectory_list = np.clip(weights_per_trajectory_list, a_min = wisw_ci_diff_lower, a_max = wisw_ci_diff_upper)
+# #weights_per_trajectory_list = np.clip(weights_per_trajectory_list, a_min = wisw_ci_diff_lower, a_max = wisw_ci_diff_upper)
 
-#weights_per_trajectory_list = np.clip(weights_per_trajectory_list, a_min = 0.0, a_max = 10)
+# #weights_per_trajectory_list = np.clip(weights_per_trajectory_list, a_min = 0.0, a_max = 10)
 
-# Compute mean WIS across all trajectories
-weights_per_trajectory_list = np.array(weights_per_trajectory_list)
-total_rewards_per_trajectory_list = np.array(total_rewards_per_trajectory_list)
-weighted_rewards_per_trajectory_list = np.array(weighted_rewards_per_trajectory_list)
+# # Compute mean WIS across all trajectories
+# weights_per_trajectory_list = np.array(weights_per_trajectory_list)
+# total_rewards_per_trajectory_list = np.array(total_rewards_per_trajectory_list)
+# weighted_rewards_per_trajectory_list = np.array(weighted_rewards_per_trajectory_list)
 
-wis_trajectory_level = (weights_per_trajectory_list * weighted_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum() 
+# wis_trajectory_level = (weights_per_trajectory_list * weighted_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum() 
 
 #wis_trajectory_level = weighted_rewards_per_trajectory_list.mean()
 
@@ -650,33 +658,33 @@ wis_trajectory_level = (weights_per_trajectory_list * weighted_rewards_per_traje
 # then weight across trajectories with
 #   w_j = prod_t [pi_model(a_t|s_t) / pi_clinician(a_t|s_t)]
 #   R_WIS = sum_j w_j * R_j / sum_j w_j
-# trajectory_returns_method2 = []
-# trajectory_is_weights_method2 = []
+trajectory_returns_method2 = []
+trajectory_is_weights_method2 = []
 
-# for patient_id in unique_patients:
-#     patient_mask = eval_patient_ids == patient_id
-#     patient_rewards = eval_rewards[patient_mask]
-#     trajectory_step_ratios = is_weight[patient_mask]
-#     if use_is_clipping:
-#         trajectory_step_ratios = np.clip(trajectory_step_ratios, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+for patient_id in unique_patients:
+    patient_mask = eval_patient_ids == patient_id
+    patient_rewards = eval_rewards[patient_mask]
+    trajectory_step_ratios = is_weight[patient_mask]
+    if use_is_clipping:
+        trajectory_step_ratios = np.clip(trajectory_step_ratios, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
 
-#     # R_j: total trajectory return
-#     trajectory_returns_method2.append(patient_rewards.sum())
+    # R_j: total trajectory return
+    trajectory_returns_method2.append(patient_rewards.sum())
 
-#     # w_j = prod_t ratio_t, with epsilon guard for numerical stability
-#     trajectory_weight = np.prod(trajectory_step_ratios)
-#     if use_is_clipping:
-#         trajectory_weight = np.clip(trajectory_weight, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
-#     trajectory_is_weights_method2.append(trajectory_weight)
+    # w_j = prod_t ratio_t, with epsilon guard for numerical stability
+    trajectory_weight = np.prod(trajectory_step_ratios)
+    if use_is_clipping:
+        trajectory_weight = np.clip(trajectory_weight, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+    trajectory_is_weights_method2.append(trajectory_weight)
 
-# total_rewards_per_trajectory_list = np.array(trajectory_returns_method2)
-# weights_per_trajectory_list = np.array(trajectory_is_weights_method2)
-# weighted_rewards_per_trajectory_list = total_rewards_per_trajectory_list.copy()
+total_rewards_per_trajectory_list = np.array(trajectory_returns_method2)
+weights_per_trajectory_list = np.array(trajectory_is_weights_method2)
+weighted_rewards_per_trajectory_list = total_rewards_per_trajectory_list.copy()
 
-# if weights_per_trajectory_list.sum() > 0:
-#     wis_trajectory_level = (weights_per_trajectory_list * total_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum()
-# else:
-#     wis_trajectory_level = 0.0
+if weights_per_trajectory_list.sum() > 0:
+    wis_trajectory_level = (weights_per_trajectory_list * total_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum()
+else:
+    wis_trajectory_level = 0.0
 
 
 # METHOD 3:

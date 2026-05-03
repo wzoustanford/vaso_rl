@@ -327,6 +327,8 @@ def train_block_discrete_cql(
     vp2_bins: int = 5,
     epochs: int = 100,
     reward_model_path: str = None,
+    reward_source: str = "manual",
+    reward_prefix_override: str = None,
     suffix: str = "",
     save_dir: str = "experiment/ql",
     reward_combine_lambda: float = None,
@@ -342,6 +344,9 @@ def train_block_discrete_cql(
         vp2_bins: Number of bins for VP2 discretization (for Q-learning action space)
         epochs: Number of training epochs
         reward_model_path: Path to learned reward model (gcl/iq_learn/maxent/unet/transformer)
+        reward_source: Reward source to use when reward_model_path is None.
+            Supports 'manual' and 'mortality_only'.
+        reward_prefix_override: Optional exact reward prefix for checkpoint naming.
         suffix: Suffix to add to experiment prefix
         save_dir: Directory to save models
         reward_combine_lambda: If None, use pure IRL reward. If in [0, 1], use
@@ -365,9 +370,13 @@ def train_block_discrete_cql(
     # Initialize data pipeline and infer reward type
     print("\nInitializing Block Discrete CQL data pipeline...", flush=True)
     if reward_model_path is None:
-        reward_type = "manual"
+        if reward_source not in ("manual", "mortality_only"):
+            raise ValueError(
+                f"reward_source='{reward_source}' requires --reward_model_path unless it is manual or mortality_only"
+            )
+        reward_type = reward_source
         pipeline = IntegratedDataPipelineV3(
-            model_type='dual', reward_source='manual', random_seed=42,
+            model_type='dual', reward_source=reward_source, random_seed=42,
             combined_or_train_data_path=combined_or_train_data_path,
             eval_data_path=eval_data_path
         )
@@ -465,8 +474,10 @@ def train_block_discrete_cql(
         raise ValueError(f"Cannot infer reward model type from path: {reward_model_path}")
     
     # Use pipeline's get_reward_prefix for correct naming with lambda
-    experiment_prefix = pipeline.get_reward_prefix() if hasattr(pipeline, 'get_reward_prefix') else reward_type
-    experiment_prefix = f"{experiment_prefix}_{suffix}"
+    experiment_prefix = reward_prefix_override or (
+        pipeline.get_reward_prefix() if hasattr(pipeline, 'get_reward_prefix') else reward_type
+    )
+    experiment_prefix = f"{experiment_prefix}{suffix}"
     
     print("="*70, flush=True)
     print(f" BLOCK DISCRETE CQL TRAINING WITH ALPHA={alpha}", flush=True)
@@ -629,6 +640,11 @@ def main():
                        help='Number of training epochs (default: 100)')
     parser.add_argument('--reward_model_path', type=str, default=None,
                        help='Path to learned reward model (gcl/iq_learn/maxent/unet/transformer). None=manual reward')
+    parser.add_argument('--reward_source', type=str, default='manual',
+                       choices=['manual', 'mortality_only'],
+                       help='Reward source to use when --reward_model_path is not provided.')
+    parser.add_argument('--reward_prefix_override', type=str, default=None,
+                       help='Optional exact reward prefix for checkpoint naming.')
     parser.add_argument('--suffix', type=str, default='',
                        help='Suffix to add to experiment prefix (e.g., "_irl100")')
     parser.add_argument('--save_dir', type=str, default='experiment/ql',
@@ -672,7 +688,8 @@ def main():
         print(f"  - IRL model VP2 bins: {irl_vp2_bins} (different from Q-learning)", flush=True)
     print(f"  - Alpha values: {alphas}", flush=True)
     print(f"  - Epochs: {args.epochs}", flush=True)
-    print(f"  - Reward model: {args.reward_model_path or 'manual'}", flush=True)
+    print(f"  - Reward model: {args.reward_model_path or 'None'}", flush=True)
+    print(f"  - Reward source: {args.reward_source}", flush=True)
     print(f"  - Reward combine lambda: {args.reward_combine_lambda}", flush=True)
     print(f"  - Suffix: {args.suffix}", flush=True)
     print("  - Consistent hyperparameters (tau=0.8, lr=1e-3)", flush=True)
@@ -694,6 +711,8 @@ def main():
             vp2_bins=vp2_bins,
             epochs=args.epochs,
             reward_model_path=args.reward_model_path,
+            reward_source=args.reward_source,
+            reward_prefix_override=args.reward_prefix_override,
             suffix=args.suffix,
             save_dir=args.save_dir,
             reward_combine_lambda=args.reward_combine_lambda,

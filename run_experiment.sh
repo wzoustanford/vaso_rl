@@ -10,6 +10,7 @@
 #   ./run_experiment.sh iq_learn --iq_init_temp 0.01 --iq_tau 0.01 --iq_lr 1e-3 --iq_div chi
 #   ./run_experiment.sh unet --unet_epochs 100 --unet_conv_h_dim 16
 #   ./run_experiment.sh unet --skip_irl --irl_model_path experiments/unet/model_epoch_100.pt
+#   ./run_experiment.sh unet --mortality_reward_only --ql_epochs 100
 #   ./run_experiment.sh unet --unet_ablation causal  # Run with causal ablation
 #   ./run_experiment.sh unet --unet_ablation single_transition_context  # Run with single transition context
 #   ./run_experiment.sh semi_supervised_unet --unet_epochs 100 --unet_conv_h_dim 64
@@ -59,6 +60,7 @@ UNET_GAMMA=0.99
 UNET_LR=1e-4
 UNET_ABLATION=""  # Empty means no ablation (default)
 SKIP_IRL=false
+MORTALITY_REWARD_ONLY=false
 
 # IRL model vp2_bins (for loading pre-trained models with different vp2_bins)
 IRL_VP2_BINS=""  # Empty means use same as VP2_BINS
@@ -108,6 +110,10 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --suffix)
+            if [[ $# -lt 2 || "$2" == --* ]]; then
+                echo "Error: --suffix requires a non-option argument"
+                exit 1
+            fi
             SUFFIX="$2"
             shift 2
             ;;
@@ -168,6 +174,11 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --skip_irl)
+            SKIP_IRL=true
+            shift
+            ;;
+        --mortality_reward_only)
+            MORTALITY_REWARD_ONLY=true
             SKIP_IRL=true
             shift
             ;;
@@ -239,6 +250,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "$SUFFIX" =~ ^[[:space:]]*$ ]]; then
+    SUFFIX=""
+else
+    SUFFIX="$(printf '%s' "$SUFFIX" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ "$SUFFIX" =~ [[:space:]] ]]; then
+        echo "Error: --suffix must not contain whitespace"
+        exit 1
+    fi
+fi
+
 echo "=============================================="
 echo "Experiment Pipeline"
 echo "=============================================="
@@ -249,6 +270,7 @@ echo "VP2 Bins: $VP2_BINS"
 echo "Test Mode: $TEST_MODE"
 echo "Time One Batch: $TIME_ONE_BATCH"
 echo "Skip IRL: $SKIP_IRL"
+echo "Mortality reward only: $MORTALITY_REWARD_ONLY"
 echo "Suffix: $SUFFIX"
 if [ "$ALGORITHM" == "gcl" ]; then
     echo "GCL tau: $GCL_TAU"
@@ -325,7 +347,14 @@ mkdir -p "$QL_DIR"
 mkdir -p "$RESULTS_DIR"
 
 # Step 1: IRL Training (skip for manual or if --skip_irl is set)
-if [ "$ALGORITHM" == "manual" ]; then
+if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+    echo ""
+    echo "=============================================="
+    echo "Step 1: Skipping IRL Training (using mortality-only reward)"
+    echo "=============================================="
+    echo "Mortality-only reward is binary: terminal death=1.0, all other transitions=0.0"
+    REWARD_MODEL_PATH=""
+elif [ "$ALGORITHM" == "manual" ]; then
     echo ""
     echo "=============================================="
     echo "Step 1: Skipping IRL Training (using manual reward)"
@@ -425,7 +454,7 @@ else
             REWARD_MODEL_PATH="${IRL_DIR}/iq_learn${SUFFIX}_q_model.pt"
             ;;
         unet)
-            UNET_DIR="${EXPERIMENT_DIR}/unet_${SUFFIX}"
+            UNET_DIR="${EXPERIMENT_DIR}/unet${SUFFIX}"
             mkdir -p "$UNET_DIR"
             UNET_CMD="python ${SCRIPT_DIR}/unet_reward_generator_tanh.py \
                 --epochs $UNET_EPOCHS \
@@ -464,7 +493,7 @@ else
             fi
             ;;
         unet_maxent)
-            UNET_DIR="${EXPERIMENT_DIR}/unet_${SUFFIX}"
+            UNET_DIR="${EXPERIMENT_DIR}/unet${SUFFIX}"
             mkdir -p "$UNET_DIR"
             UNET_CMD="python ${SCRIPT_DIR}/unet_reward_generator_tanh_maxent.py \
                 --epochs $UNET_EPOCHS \
@@ -492,7 +521,7 @@ else
             fi
             ;;
         transformer_context_irl)
-            UNET_DIR="${EXPERIMENT_DIR}/transformer_${SUFFIX}"
+            UNET_DIR="${EXPERIMENT_DIR}/transformer${SUFFIX}"
             mkdir -p "$UNET_DIR"
             UNET_CMD="python ${SCRIPT_DIR}/transformer_reward_generator_tanh.py \
                 --epochs $UNET_EPOCHS \
@@ -593,12 +622,15 @@ if [ "$USE_LSTM" == "true" ]; then
         --save_dir $QL_DIR \
         --log_dir ${EXPERIMENT_DIR}/logs"
 
-    if [ -n "$SUFFIX" ]; then
+    if [[ -n "$SUFFIX" ]]; then
         QL_CMD="$QL_CMD --suffix $SUFFIX"
     fi
 
     if [ -n "$REWARD_MODEL_PATH" ]; then
         QL_CMD="$QL_CMD --reward_model_path $REWARD_MODEL_PATH"
+    fi
+    if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+        QL_CMD="$QL_CMD --reward_source mortality_only --reward_prefix_override ${ALGORITHM}_mortality_only"
     fi
 
     if [ -n "$IRL_VP2_BINS" ]; then
@@ -623,7 +655,9 @@ if [ "$USE_LSTM" == "true" ]; then
     eval $QL_CMD
 
     # Determine the model prefix for LSTM (includes lstm_ prefix)
-    if [ -n "$REWARD_COMBINE_LAMBDA" ]; then
+    if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+        MODEL_PREFIX="lstm_${ALGORITHM}_mortality_only${SUFFIX}"
+    elif [ -n "$REWARD_COMBINE_LAMBDA" ]; then
         LAMBDA_STR=$(echo "$REWARD_COMBINE_LAMBDA" | sed 's/0*$//' | sed 's/\.$//')
         MODEL_PREFIX="lstm_${ALGORITHM}_combined_manual_lambda${LAMBDA_STR}${SUFFIX}"
     else
@@ -632,18 +666,20 @@ if [ "$USE_LSTM" == "true" ]; then
 else
     # Build standard Q-Learning command
     QL_CMD="python ${SCRIPT_DIR}/run_block_discrete_cql_allalphas.py \
-	    --suffix $SUFFIX \
         --single_alpha 0.0 \
         --vp2_bins $VP2_BINS \
         --epochs $QL_EPOCHS \
         --save_dir $QL_DIR"
 
-    if [ -n "$SUFFIX" ]; then
+    if [[ -n "$SUFFIX" ]]; then
         QL_CMD="$QL_CMD --suffix $SUFFIX"
     fi
 
     if [ -n "$REWARD_MODEL_PATH" ]; then
         QL_CMD="$QL_CMD --reward_model_path $REWARD_MODEL_PATH"
+    fi
+    if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+        QL_CMD="$QL_CMD --reward_source mortality_only --reward_prefix_override ${ALGORITHM}_mortality_only"
     fi
 
     if [ -n "$IRL_VP2_BINS" ]; then
@@ -668,11 +704,13 @@ else
     eval $QL_CMD
 
     # Determine the model prefix for standard Q-learning
-    if [ -n "$REWARD_COMBINE_LAMBDA" ]; then
+    if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+        MODEL_PREFIX="${ALGORITHM}_mortality_only${SUFFIX}"
+    elif [ -n "$REWARD_COMBINE_LAMBDA" ]; then
         LAMBDA_STR=$(echo "$REWARD_COMBINE_LAMBDA" | sed 's/0*$//' | sed 's/\.$//')
         MODEL_PREFIX="${ALGORITHM}_combined_manual_lambda${LAMBDA_STR}${SUFFIX}"
     else
-        MODEL_PREFIX="${ALGORITHM}_${SUFFIX}"
+        MODEL_PREFIX="${ALGORITHM}${SUFFIX}"
     fi
 fi
 
@@ -711,6 +749,9 @@ else
 
     if [ -n "$EVAL_DATA_PATH" ]; then
         WIS_CMD="$WIS_CMD --eval_data_path $EVAL_DATA_PATH"
+    fi
+    if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+        WIS_CMD="$WIS_CMD --reward_type mortality_only"
     fi
 
     eval $WIS_CMD 2>&1 | tee "$RESULTS_FILE"

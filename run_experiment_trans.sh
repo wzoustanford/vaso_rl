@@ -6,6 +6,7 @@
 #   ./run_experiment_trans.sh --test
 #   ./run_experiment_trans.sh --trans_epochs 100 --ql_epochs 100
 #   ./run_experiment_trans.sh --skip_irl --irl_model_path experiments/transformer/model_epoch_100.pt
+#   ./run_experiment_trans.sh --mortality_reward_only --ql_epochs 100
 #   ./run_experiment_trans.sh --use_lstm --ql_epochs 500
 #   ./run_experiment_trans.sh --combined_or_train_data_path sample_data_oviss.csv
 
@@ -29,6 +30,7 @@ TRANS_GAMMA=0.99
 TRANS_LR=1e-4
 TRANS_SEQUENCE_LENGTH=40
 SKIP_IRL=false
+MORTALITY_REWARD_ONLY=false
 RESUME_IRL_MODEL_PATH=""
 
 IRL_VP2_BINS=""
@@ -74,6 +76,10 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --suffix)
+            if [[ $# -lt 2 || "$2" == --* ]]; then
+                echo "Error: --suffix requires a non-option argument"
+                exit 1
+            fi
             SUFFIX="$2"
             shift 2
             ;;
@@ -118,6 +124,11 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --skip_irl)
+            SKIP_IRL=true
+            shift
+            ;;
+        --mortality_reward_only)
+            MORTALITY_REWARD_ONLY=true
             SKIP_IRL=true
             shift
             ;;
@@ -193,6 +204,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "$SUFFIX" =~ ^[[:space:]]*$ ]]; then
+    SUFFIX=""
+else
+    SUFFIX="$(printf '%s' "$SUFFIX" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ "$SUFFIX" =~ [[:space:]] ]]; then
+        echo "Error: --suffix must not contain whitespace"
+        exit 1
+    fi
+fi
+
 echo "=============================================="
 echo "Transformer Experiment Pipeline"
 echo "=============================================="
@@ -202,6 +223,7 @@ echo "VP2 Bins: $VP2_BINS"
 echo "Test Mode: $TEST_MODE"
 echo "Time One Batch: $TIME_ONE_BATCH"
 echo "Skip IRL: $SKIP_IRL"
+echo "Mortality reward only: $MORTALITY_REWARD_ONLY"
 echo "Suffix: $SUFFIX"
 echo "Transformer batch_size: $TRANS_BATCH_SIZE"
 echo "Transformer d_model: $TRANS_D_MODEL"
@@ -263,7 +285,14 @@ mkdir -p "$IRL_DIR"
 mkdir -p "$QL_DIR"
 mkdir -p "$RESULTS_DIR"
 
-if [ "$SKIP_IRL" == "true" ] && [ -n "$IRL_MODEL_PATH" ]; then
+if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+    echo ""
+    echo "=============================================="
+    echo "Step 1: Skipping IRL Training (using mortality-only reward)"
+    echo "=============================================="
+    echo "Mortality-only reward is binary: terminal death=1.0, all other transitions=0.0"
+    REWARD_MODEL_PATH=""
+elif [ "$SKIP_IRL" == "true" ] && [ -n "$IRL_MODEL_PATH" ]; then
     echo ""
     echo "=============================================="
     echo "Step 1: Skipping IRL Training (using pre-trained model)"
@@ -357,11 +386,14 @@ if [ "$USE_LSTM" == "true" ]; then
         --save_dir $QL_DIR \
         --log_dir ${EXPERIMENT_DIR}/logs"
 
-    if [ -n "$SUFFIX" ]; then
+    if [[ -n "$SUFFIX" ]]; then
         QL_CMD="$QL_CMD --suffix $SUFFIX"
     fi
     if [ -n "$REWARD_MODEL_PATH" ]; then
         QL_CMD="$QL_CMD --reward_model_path $REWARD_MODEL_PATH"
+    fi
+    if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+        QL_CMD="$QL_CMD --reward_source mortality_only --reward_prefix_override transformer_mortality_only"
     fi
     if [ -n "$IRL_VP2_BINS" ]; then
         QL_CMD="$QL_CMD --irl_vp2_bins $IRL_VP2_BINS"
@@ -382,7 +414,9 @@ if [ "$USE_LSTM" == "true" ]; then
     mkdir -p "${EXPERIMENT_DIR}/logs"
     eval $QL_CMD
 
-    if [ -n "$REWARD_COMBINE_LAMBDA" ]; then
+    if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+        MODEL_PREFIX="lstm_transformer_mortality_only${SUFFIX}"
+    elif [ -n "$REWARD_COMBINE_LAMBDA" ]; then
         LAMBDA_STR=$(echo "$REWARD_COMBINE_LAMBDA" | sed 's/0*$//' | sed 's/\.$//')
         MODEL_PREFIX="lstm_transformer_combined_manual_lambda${LAMBDA_STR}${SUFFIX}"
     else
@@ -395,11 +429,14 @@ else
         --epochs $QL_EPOCHS \
         --save_dir $QL_DIR"
 
-    if [ -n "$SUFFIX" ]; then
+    if [[ -n "$SUFFIX" ]]; then
         QL_CMD="$QL_CMD --suffix $SUFFIX"
     fi
     if [ -n "$REWARD_MODEL_PATH" ]; then
         QL_CMD="$QL_CMD --reward_model_path $REWARD_MODEL_PATH"
+    fi
+    if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+        QL_CMD="$QL_CMD --reward_source mortality_only --reward_prefix_override transformer_mortality_only"
     fi
     if [ -n "$IRL_VP2_BINS" ]; then
         QL_CMD="$QL_CMD --irl_vp2_bins $IRL_VP2_BINS"
@@ -419,7 +456,9 @@ else
 
     eval $QL_CMD
 
-    if [ -n "$REWARD_COMBINE_LAMBDA" ]; then
+    if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+        MODEL_PREFIX="transformer_mortality_only${SUFFIX}"
+    elif [ -n "$REWARD_COMBINE_LAMBDA" ]; then
         LAMBDA_STR=$(echo "$REWARD_COMBINE_LAMBDA" | sed 's/0*$//' | sed 's/\.$//')
         MODEL_PREFIX="transformer_combined_manual_lambda${LAMBDA_STR}${SUFFIX}"
     else
@@ -457,6 +496,9 @@ else
     fi
     if [ -n "$EVAL_DATA_PATH" ]; then
         WIS_CMD="$WIS_CMD --eval_data_path $EVAL_DATA_PATH"
+    fi
+    if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+        WIS_CMD="$WIS_CMD --reward_type mortality_only"
     fi
 
     eval $WIS_CMD 2>&1 | tee "$RESULTS_FILE"
