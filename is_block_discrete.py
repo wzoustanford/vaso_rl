@@ -36,6 +36,11 @@ parser.add_argument('--eval_data_path', type=str, default=None,
                         'dual-dataset mode where this dataset is split 50/50 into val/test.')
 parser.add_argument('--use_lstm', action='store_true',
                    help='Use LSTM Q-network instead of standard feedforward network')
+parser.add_argument('--policy_model_type', type=str, default='q',
+                   choices=['q', 'gail', 'transformer_policy'],
+                   help='Checkpoint type to evaluate: q for CQL/SQIL Q-network checkpoints, '
+                        'gail for run_block_discrete_gail.py checkpoints, or '
+                        'transformer_policy for transformer_policy_model.py checkpoints')
 parser.add_argument('--disable_is_clipping', action='store_true',
                    help='Disable percentile-based clipping for IS weights and trajectory multiplied weights')
 parser.add_argument('--is_clip_lower_pct', type=float, default=0.5,
@@ -56,7 +61,11 @@ eval_set = args.eval_set
 reward_type = args.reward_type
 irl_model_path = args.irl_model_path
 use_lstm = args.use_lstm
+policy_model_type = args.policy_model_type
 use_is_clipping = not args.disable_is_clipping
+
+if use_lstm and policy_model_type != 'q':
+    parser.error("--use_lstm is only valid with --policy_model_type q")
 
 # Define constants
 STATE_DIM = 17  # 17 state features for dual model
@@ -70,8 +79,37 @@ print(f"Using device: {device}")
 n_actions = 2 * n_bins  # VP1 (2 options: 0,1) x VP2 (5 bins) = 10 total actions
 state_dim = STATE_DIM  # 17 features
 
-# Initialize and load Q-networks based on model type
-if use_lstm:
+# Initialize and load policy/Q model based on checkpoint type
+if policy_model_type == 'gail':
+    from run_block_discrete_gail import GAILPolicyNetwork
+
+    checkpoint = torch.load(model_path, map_location=device)
+    checkpoint_state_dim = checkpoint.get('state_dim', state_dim)
+    checkpoint_vp2_bins = checkpoint.get('vp2_bins', n_bins)
+    if checkpoint_vp2_bins != n_bins:
+        raise ValueError(f"Checkpoint vp2_bins={checkpoint_vp2_bins} does not match --vp2_bins={n_bins}")
+
+    gail_policy = GAILPolicyNetwork(state_dim=checkpoint_state_dim, vp2_bins=n_bins).to(device)
+    gail_policy.load_state_dict(checkpoint['policy_state_dict'])
+    gail_policy.eval()
+
+    print(f"Loaded GAIL policy from: {model_path}")
+    print(f"State dimension: {checkpoint_state_dim}")
+    print(f"Number of actions: {n_actions} (VP1: 2 binary × VP2: {n_bins} bins)")
+    print("Model type: GAIL policy network")
+elif policy_model_type == 'transformer_policy':
+    from transformer_policy_model import load_model as load_transformer_policy_model
+
+    transformer_policy, transformer_policy_config = load_transformer_policy_model(model_path, device=device)
+    checkpoint_vp2_bins = transformer_policy_config.get('vp2_bins', n_bins)
+    if checkpoint_vp2_bins != n_bins:
+        raise ValueError(f"Checkpoint vp2_bins={checkpoint_vp2_bins} does not match --vp2_bins={n_bins}")
+
+    print(f"Loaded transformer policy from: {model_path}")
+    print(f"State dimension: {transformer_policy.state_size}")
+    print(f"Number of actions: {n_actions} (VP1: 2 binary × VP2: {n_bins} bins)")
+    print("Model type: Transformer policy network")
+elif use_lstm:
     # Import LSTM network class
     from lstm_block_discrete_cql_network import LSTMDiscreteQNetwork
 
@@ -283,6 +321,42 @@ def select_action_batch_discrete_lstm(states, q1_net, q2_net, device):
 
         return best_action_indices
 
+
+def select_action_batch_discrete_gail(states, policy_net, device):
+    """
+    Select greedy actions for a batch of states using a GAIL policy checkpoint.
+    Returns: numpy array of discrete action indices [0, n_actions-1]
+    """
+    with torch.no_grad():
+        if states.ndim == 1:
+            states = states.reshape(1, -1)
+        state_tensor = torch.FloatTensor(states).to(device)
+        probs = policy_net(state_tensor)
+        return probs.argmax(dim=1).cpu().numpy()
+
+
+def select_action_batch_discrete_transformer_policy(states, patient_ids, policy_net, device):
+    """
+    Select greedy actions with the transformer policy while preserving patient order.
+
+    The policy is sequence-contextual, so each patient's transitions are evaluated as
+    contiguous chunks up to policy_net.max_seq_length instead of independent rows.
+    """
+    model_actions = np.zeros(len(states), dtype=np.int64)
+    with torch.no_grad():
+        for patient_id in np.unique(patient_ids):
+            patient_indices = np.where(patient_ids == patient_id)[0]
+            patient_states = states[patient_indices]
+
+            for start in range(0, len(patient_states), policy_net.max_seq_length):
+                end = min(start + policy_net.max_seq_length, len(patient_states))
+                chunk = torch.FloatTensor(patient_states[start:end]).unsqueeze(0).to(device)
+                logits = policy_net(chunk)
+                chunk_actions = logits.argmax(dim=-1).squeeze(0).cpu().numpy()
+                model_actions[patient_indices[start:end]] = chunk_actions
+
+    return model_actions
+
 # Helper function to convert continuous actions to discrete indices
 def continuous_to_discrete_action(actions, vp2_edges, vp2_bins):
     """
@@ -302,13 +376,25 @@ def continuous_to_discrete_action(actions, vp2_edges, vp2_bins):
 
 # Get model actions as discrete indices (0-9)
 print("Computing model actions (discrete) for training data...")
-if use_lstm:
+if policy_model_type == 'gail':
+    train_model_actions_discrete = select_action_batch_discrete_gail(train_data['states'], gail_policy, device)
+elif policy_model_type == 'transformer_policy':
+    train_model_actions_discrete = select_action_batch_discrete_transformer_policy(
+        train_data['states'], train_data['patient_ids'], transformer_policy, device
+    )
+elif use_lstm:
     train_model_actions_discrete = select_action_batch_discrete_lstm(train_data['states'], q1_network, q2_network, device)
 else:
     train_model_actions_discrete = select_action_batch_discrete(train_data['states'], q1_network, q2_network, n_bins, device)
 
 print(f"Computing model actions (discrete) for {eval_set_name.lower()} data...")
-if use_lstm:
+if policy_model_type == 'gail':
+    eval_model_actions_discrete = select_action_batch_discrete_gail(eval_data['states'], gail_policy, device)
+elif policy_model_type == 'transformer_policy':
+    eval_model_actions_discrete = select_action_batch_discrete_transformer_policy(
+        eval_data['states'], eval_data['patient_ids'], transformer_policy, device
+    )
+elif use_lstm:
     eval_model_actions_discrete = select_action_batch_discrete_lstm(eval_data['states'], q1_network, q2_network, device)
 else:
     eval_model_actions_discrete = select_action_batch_discrete(eval_data['states'], q1_network, q2_network, n_bins, device)
