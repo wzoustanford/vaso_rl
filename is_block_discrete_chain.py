@@ -37,7 +37,7 @@ q1_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(
 q2_network = DualBlockDiscreteQNetwork(state_dim=state_dim, vp2_bins=n_bins).to(device)
 
 # Load the trained model checkpoint
-model_path = '/scratch/zouwil/code/ucsf_rl/experiment/block_discrete_cql_alpha0.0000_bins5_best.pt'
+model_path = '/scratch/code/ucsf_rl/experiment/block_discrete_cql_alpha0.0000_bins5_best.pt'
 checkpoint = torch.load(model_path, map_location=device)
 q1_network.load_state_dict(checkpoint['q1_state_dict'])
 q2_network.load_state_dict(checkpoint['q2_state_dict'])
