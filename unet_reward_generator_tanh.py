@@ -7,6 +7,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 import os
 import json
+import time
 from datetime import datetime
 
 # Local imports
@@ -416,7 +417,7 @@ def evaluate_validation(
     }
 
 
-def train(config: Config, data_pipeline):
+def train(config: Config, data_pipeline, time_one_batch: bool = False):
     """
     Main training loop for U-Net reward generator.
     """
@@ -470,6 +471,30 @@ def train(config: Config, data_pipeline):
 
             optimizer.zero_grad()
             print(f"[DEBUG] Calling compute_training_step...") if batch_idx == 0 else None
+
+            if time_one_batch:
+                batch_transitions = states.shape[0] * states.shape[1]
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                start = time.perf_counter()
+                loss, metrics = compute_training_step(model, states, actions, config, device)
+                loss.backward()
+                optimizer.step()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                end = time.perf_counter()
+                batch_time = end - start
+                timing_save_path = os.path.join(config.experiment_dir, "timing_batch_model.pt")
+                save_model(model, config, timing_save_path)
+                print(f"UNET_BATCH_SHAPE={tuple(states.shape)}")
+                print(f"UNET_BATCH_SAMPLES={states.shape[0]}")
+                print(f"UNET_BATCH_TRANSITIONS={batch_transitions}")
+                print(f"UNET_BATCH_TIME_SECONDS={batch_time}")
+                print(f"UNET_SECONDS_PER_SAMPLE={batch_time / states.shape[0]}")
+                print(f"UNET_SECONDS_PER_TRANSITION={batch_time / batch_transitions}")
+                print(f"UNET_TIMING_MODEL_PATH={timing_save_path}")
+                return model
+
             loss, metrics = compute_training_step(model, states, actions, config, device)
             print(f"[DEBUG] Loss computed: {loss.item():.4f}") if batch_idx == 0 else None
 
@@ -584,6 +609,8 @@ def main():
     parser.add_argument('--eval_data_path', type=str, default=None,
                        help='Path to evaluation dataset (for val/test). If provided, enables '
                             'dual-dataset mode where this dataset is split 50/50 into val/test.')
+    parser.add_argument('--time_one_batch', action='store_true',
+                       help='Run one U-Net training batch, print timing, and exit.')
     parser.add_argument('--ablation_setting', type=str, default=None,
                        help='Ablation setting: "causal" or "single_transition_context"')
     args = parser.parse_args()
@@ -625,7 +652,7 @@ def main():
     )
 
     # Train model
-    model = train(config, pipeline)
+    model = train(config, pipeline, time_one_batch=args.time_one_batch)
 
     print("Done!")
 

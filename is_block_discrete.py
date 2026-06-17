@@ -23,8 +23,8 @@ parser.add_argument('--vp2_bins', type=int, default=5,
                    help='Number of bins for VP2 discretization (default: 5)')
 parser.add_argument('--eval_set', type=str, default='test', choices=['val', 'test'],
                    help='Which data split to evaluate on (default: test)')
-parser.add_argument('--reward_type', type=str, default='manual', choices=['manual', 'irl'],
-                   help='Reward type: manual (clinician-defined) or irl (learned from IRL model)')
+parser.add_argument('--reward_type', type=str, default='manual', choices=['manual', 'irl', 'mortality_only'],
+                   help='Reward type: manual, irl, or mortality_only sparse terminal death indicator')
 parser.add_argument('--irl_model_path', type=str, default=None,
                    help='Path to IRL model for reward computation (required if reward_type=irl)')
 parser.add_argument('--combined_or_train_data_path', type=str, default=None,
@@ -36,6 +36,11 @@ parser.add_argument('--eval_data_path', type=str, default=None,
                         'dual-dataset mode where this dataset is split 50/50 into val/test.')
 parser.add_argument('--use_lstm', action='store_true',
                    help='Use LSTM Q-network instead of standard feedforward network')
+parser.add_argument('--policy_model_type', type=str, default='q',
+                   choices=['q', 'gail', 'transformer_policy'],
+                   help='Checkpoint type to evaluate: q for CQL/SQIL Q-network checkpoints, '
+                        'gail for run_block_discrete_gail.py checkpoints, or '
+                        'transformer_policy for transformer_policy_model.py checkpoints')
 parser.add_argument('--disable_is_clipping', action='store_true',
                    help='Disable percentile-based clipping for IS weights and trajectory multiplied weights')
 parser.add_argument('--is_clip_lower_pct', type=float, default=0.5,
@@ -56,7 +61,11 @@ eval_set = args.eval_set
 reward_type = args.reward_type
 irl_model_path = args.irl_model_path
 use_lstm = args.use_lstm
+policy_model_type = args.policy_model_type
 use_is_clipping = not args.disable_is_clipping
+
+if use_lstm and policy_model_type != 'q':
+    parser.error("--use_lstm is only valid with --policy_model_type q")
 
 # Define constants
 STATE_DIM = 17  # 17 state features for dual model
@@ -70,8 +79,37 @@ print(f"Using device: {device}")
 n_actions = 2 * n_bins  # VP1 (2 options: 0,1) x VP2 (5 bins) = 10 total actions
 state_dim = STATE_DIM  # 17 features
 
-# Initialize and load Q-networks based on model type
-if use_lstm:
+# Initialize and load policy/Q model based on checkpoint type
+if policy_model_type == 'gail':
+    from run_block_discrete_gail import GAILPolicyNetwork
+
+    checkpoint = torch.load(model_path, map_location=device)
+    checkpoint_state_dim = checkpoint.get('state_dim', state_dim)
+    checkpoint_vp2_bins = checkpoint.get('vp2_bins', n_bins)
+    if checkpoint_vp2_bins != n_bins:
+        raise ValueError(f"Checkpoint vp2_bins={checkpoint_vp2_bins} does not match --vp2_bins={n_bins}")
+
+    gail_policy = GAILPolicyNetwork(state_dim=checkpoint_state_dim, vp2_bins=n_bins).to(device)
+    gail_policy.load_state_dict(checkpoint['policy_state_dict'])
+    gail_policy.eval()
+
+    print(f"Loaded GAIL policy from: {model_path}")
+    print(f"State dimension: {checkpoint_state_dim}")
+    print(f"Number of actions: {n_actions} (VP1: 2 binary × VP2: {n_bins} bins)")
+    print("Model type: GAIL policy network")
+elif policy_model_type == 'transformer_policy':
+    from transformer_policy_model import load_model as load_transformer_policy_model
+
+    transformer_policy, transformer_policy_config = load_transformer_policy_model(model_path, device=device)
+    checkpoint_vp2_bins = transformer_policy_config.get('vp2_bins', n_bins)
+    if checkpoint_vp2_bins != n_bins:
+        raise ValueError(f"Checkpoint vp2_bins={checkpoint_vp2_bins} does not match --vp2_bins={n_bins}")
+
+    print(f"Loaded transformer policy from: {model_path}")
+    print(f"State dimension: {transformer_policy.state_size}")
+    print(f"Number of actions: {n_actions} (VP1: 2 binary × VP2: {n_bins} bins)")
+    print("Model type: Transformer policy network")
+elif use_lstm:
     # Import LSTM network class
     from lstm_block_discrete_cql_network import LSTMDiscreteQNetwork
 
@@ -148,6 +186,14 @@ if reward_type == 'irl':
         print(f"Warning: Could not detect IRL model type from path, trying IQ-Learn...")
         pipeline.load_iq_learn_reward_model(irl_model_path)
 
+    train_data, val_data, test_data = pipeline.prepare_data()
+elif reward_type == 'mortality_only':
+    # Use V3 pipeline with sparse binary terminal mortality rewards.
+    pipeline = IntegratedDataPipelineV3(
+        model_type='dual', reward_source='mortality_only', random_seed=42,
+        combined_or_train_data_path=args.combined_or_train_data_path,
+        eval_data_path=args.eval_data_path
+    )
     train_data, val_data, test_data = pipeline.prepare_data()
 else:
     # Use V3 pipeline with manual rewards (supports dual-dataset mode)
@@ -275,6 +321,42 @@ def select_action_batch_discrete_lstm(states, q1_net, q2_net, device):
 
         return best_action_indices
 
+
+def select_action_batch_discrete_gail(states, policy_net, device):
+    """
+    Select greedy actions for a batch of states using a GAIL policy checkpoint.
+    Returns: numpy array of discrete action indices [0, n_actions-1]
+    """
+    with torch.no_grad():
+        if states.ndim == 1:
+            states = states.reshape(1, -1)
+        state_tensor = torch.FloatTensor(states).to(device)
+        probs = policy_net(state_tensor)
+        return probs.argmax(dim=1).cpu().numpy()
+
+
+def select_action_batch_discrete_transformer_policy(states, patient_ids, policy_net, device):
+    """
+    Select greedy actions with the transformer policy while preserving patient order.
+
+    The policy is sequence-contextual, so each patient's transitions are evaluated as
+    contiguous chunks up to policy_net.max_seq_length instead of independent rows.
+    """
+    model_actions = np.zeros(len(states), dtype=np.int64)
+    with torch.no_grad():
+        for patient_id in np.unique(patient_ids):
+            patient_indices = np.where(patient_ids == patient_id)[0]
+            patient_states = states[patient_indices]
+
+            for start in range(0, len(patient_states), policy_net.max_seq_length):
+                end = min(start + policy_net.max_seq_length, len(patient_states))
+                chunk = torch.FloatTensor(patient_states[start:end]).unsqueeze(0).to(device)
+                logits = policy_net(chunk)
+                chunk_actions = logits.argmax(dim=-1).squeeze(0).cpu().numpy()
+                model_actions[patient_indices[start:end]] = chunk_actions
+
+    return model_actions
+
 # Helper function to convert continuous actions to discrete indices
 def continuous_to_discrete_action(actions, vp2_edges, vp2_bins):
     """
@@ -294,13 +376,25 @@ def continuous_to_discrete_action(actions, vp2_edges, vp2_bins):
 
 # Get model actions as discrete indices (0-9)
 print("Computing model actions (discrete) for training data...")
-if use_lstm:
+if policy_model_type == 'gail':
+    train_model_actions_discrete = select_action_batch_discrete_gail(train_data['states'], gail_policy, device)
+elif policy_model_type == 'transformer_policy':
+    train_model_actions_discrete = select_action_batch_discrete_transformer_policy(
+        train_data['states'], train_data['patient_ids'], transformer_policy, device
+    )
+elif use_lstm:
     train_model_actions_discrete = select_action_batch_discrete_lstm(train_data['states'], q1_network, q2_network, device)
 else:
     train_model_actions_discrete = select_action_batch_discrete(train_data['states'], q1_network, q2_network, n_bins, device)
 
 print(f"Computing model actions (discrete) for {eval_set_name.lower()} data...")
-if use_lstm:
+if policy_model_type == 'gail':
+    eval_model_actions_discrete = select_action_batch_discrete_gail(eval_data['states'], gail_policy, device)
+elif policy_model_type == 'transformer_policy':
+    eval_model_actions_discrete = select_action_batch_discrete_transformer_policy(
+        eval_data['states'], eval_data['patient_ids'], transformer_policy, device
+    )
+elif use_lstm:
     eval_model_actions_discrete = select_action_batch_discrete_lstm(eval_data['states'], q1_network, q2_network, device)
 else:
     eval_model_actions_discrete = select_action_batch_discrete(eval_data['states'], q1_network, q2_network, n_bins, device)
@@ -596,51 +690,51 @@ weights_per_trajectory_list = []
 total_rewards_per_trajectory_list = []
 weighted_rewards_per_trajectory_list = []
 
-for patient_id in unique_patients:
-    patient_mask = eval_patient_ids == patient_id
-    """
-    mean_model_prob = eval_prob_model[patient_mask].mean()
-    mean_clinician_prob = eval_prob_clinician[patient_mask].mean()
-    patient_rewards = eval_rewards[patient_mask]
-    traj_is_weight = mean_model_prob /(1e-8 + mean_clinician_prob)
+# for patient_id in unique_patients:
+#     patient_mask = eval_patient_ids == patient_id
+#     """
+#     mean_model_prob = eval_prob_model[patient_mask].mean()
+#     mean_clinician_prob = eval_prob_clinician[patient_mask].mean()
+#     patient_rewards = eval_rewards[patient_mask]
+#     traj_is_weight = mean_model_prob /(1e-8 + mean_clinician_prob)
 
-    if not traj_is_weight == 0:
-        #weights_per_trajectory_list.append(patient_weights.prod())
-        weights_per_trajectory_list.append(traj_is_weight)
-        total_rewards_per_trajectory_list.append(patient_rewards.sum())
-    else:
-        print("zero encountered in trajectory level multiplied weights")
-    """
+#     if not traj_is_weight == 0:
+#         #weights_per_trajectory_list.append(patient_weights.prod())
+#         weights_per_trajectory_list.append(traj_is_weight)
+#         total_rewards_per_trajectory_list.append(patient_rewards.sum())
+#     else:
+#         print("zero encountered in trajectory level multiplied weights")
+#     """
 
-    # Get weights and rewards for this trajectory
-    patient_weights = is_weight[patient_mask]
-    patient_rewards = eval_rewards[patient_mask]
-    weights_per_trajectory_list.append(patient_weights.mean())
+#     # Get weights and rewards for this trajectory
+#     patient_weights = is_weight[patient_mask]
+#     patient_rewards = eval_rewards[patient_mask]
+#     weights_per_trajectory_list.append(patient_weights.mean())
 
-    patient_weights = np.cumprod(patient_weights)
-    if use_is_clipping:
-        patient_weights = np.clip(patient_weights, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+#     patient_weights = np.cumprod(patient_weights)
+#     if use_is_clipping:
+#         patient_weights = np.clip(patient_weights, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
     
-    # np.clip(is_weight, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
-    est_total_reward_per_traj = (patient_weights *  patient_rewards).sum() / patient_weights.sum() * len(patient_weights)
+#     # np.clip(is_weight, a_min = isw_ci_diff_lower, a_max = isw_ci_diff_upper)
+#     est_total_reward_per_traj = (patient_weights *  patient_rewards).sum() / patient_weights.sum() * len(patient_weights)
 
-    total_rewards_per_trajectory_list.append(patient_rewards.sum())
-    weighted_rewards_per_trajectory_list.append(est_total_reward_per_traj)
+#     total_rewards_per_trajectory_list.append(patient_rewards.sum())
+#     weighted_rewards_per_trajectory_list.append(est_total_reward_per_traj)
     
 
-#wisw_ci_diff_lower = np.percentile(weights_per_trajectory_list, 5)
-#wisw_ci_diff_upper = np.percentile(weights_per_trajectory_list, 95)
+# #wisw_ci_diff_lower = np.percentile(weights_per_trajectory_list, 5)
+# #wisw_ci_diff_upper = np.percentile(weights_per_trajectory_list, 95)
 
-#weights_per_trajectory_list = np.clip(weights_per_trajectory_list, a_min = wisw_ci_diff_lower, a_max = wisw_ci_diff_upper)
+# #weights_per_trajectory_list = np.clip(weights_per_trajectory_list, a_min = wisw_ci_diff_lower, a_max = wisw_ci_diff_upper)
 
-#weights_per_trajectory_list = np.clip(weights_per_trajectory_list, a_min = 0.0, a_max = 10)
+# #weights_per_trajectory_list = np.clip(weights_per_trajectory_list, a_min = 0.0, a_max = 10)
 
-# Compute mean WIS across all trajectories
-weights_per_trajectory_list = np.array(weights_per_trajectory_list)
-total_rewards_per_trajectory_list = np.array(total_rewards_per_trajectory_list)
-weighted_rewards_per_trajectory_list = np.array(weighted_rewards_per_trajectory_list)
+# # Compute mean WIS across all trajectories
+# weights_per_trajectory_list = np.array(weights_per_trajectory_list)
+# total_rewards_per_trajectory_list = np.array(total_rewards_per_trajectory_list)
+# weighted_rewards_per_trajectory_list = np.array(weighted_rewards_per_trajectory_list)
 
-wis_trajectory_level = (weights_per_trajectory_list * weighted_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum() 
+# wis_trajectory_level = (weights_per_trajectory_list * weighted_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum() 
 
 #wis_trajectory_level = weighted_rewards_per_trajectory_list.mean()
 
@@ -650,33 +744,33 @@ wis_trajectory_level = (weights_per_trajectory_list * weighted_rewards_per_traje
 # then weight across trajectories with
 #   w_j = prod_t [pi_model(a_t|s_t) / pi_clinician(a_t|s_t)]
 #   R_WIS = sum_j w_j * R_j / sum_j w_j
-# trajectory_returns_method2 = []
-# trajectory_is_weights_method2 = []
+trajectory_returns_method2 = []
+trajectory_is_weights_method2 = []
 
-# for patient_id in unique_patients:
-#     patient_mask = eval_patient_ids == patient_id
-#     patient_rewards = eval_rewards[patient_mask]
-#     trajectory_step_ratios = is_weight[patient_mask]
-#     if use_is_clipping:
-#         trajectory_step_ratios = np.clip(trajectory_step_ratios, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+for patient_id in unique_patients:
+    patient_mask = eval_patient_ids == patient_id
+    patient_rewards = eval_rewards[patient_mask]
+    trajectory_step_ratios = is_weight[patient_mask]
+    if use_is_clipping:
+        trajectory_step_ratios = np.clip(trajectory_step_ratios, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
 
-#     # R_j: total trajectory return
-#     trajectory_returns_method2.append(patient_rewards.sum())
+    # R_j: total trajectory return
+    trajectory_returns_method2.append(patient_rewards.sum())
 
-#     # w_j = prod_t ratio_t, with epsilon guard for numerical stability
-#     trajectory_weight = np.prod(trajectory_step_ratios)
-#     if use_is_clipping:
-#         trajectory_weight = np.clip(trajectory_weight, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
-#     trajectory_is_weights_method2.append(trajectory_weight)
+    # w_j = prod_t ratio_t, with epsilon guard for numerical stability
+    trajectory_weight = np.prod(trajectory_step_ratios)
+    if use_is_clipping:
+        trajectory_weight = np.clip(trajectory_weight, a_min=isw_ci_diff_lower, a_max=isw_ci_diff_upper)
+    trajectory_is_weights_method2.append(trajectory_weight)
 
-# total_rewards_per_trajectory_list = np.array(trajectory_returns_method2)
-# weights_per_trajectory_list = np.array(trajectory_is_weights_method2)
-# weighted_rewards_per_trajectory_list = total_rewards_per_trajectory_list.copy()
+total_rewards_per_trajectory_list = np.array(trajectory_returns_method2)
+weights_per_trajectory_list = np.array(trajectory_is_weights_method2)
+weighted_rewards_per_trajectory_list = total_rewards_per_trajectory_list.copy()
 
-# if weights_per_trajectory_list.sum() > 0:
-#     wis_trajectory_level = (weights_per_trajectory_list * total_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum()
-# else:
-#     wis_trajectory_level = 0.0
+if weights_per_trajectory_list.sum() > 0:
+    wis_trajectory_level = (weights_per_trajectory_list * total_rewards_per_trajectory_list).sum() / weights_per_trajectory_list.sum()
+else:
+    wis_trajectory_level = 0.0
 
 
 # METHOD 3:

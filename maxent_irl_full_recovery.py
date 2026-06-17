@@ -8,6 +8,7 @@ distribution to find the reward that best explains expert behavior.
 """
 
 import os
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -451,6 +452,46 @@ class MaxSLPIRLTrainer:
 
         return avg_loss, avg_sum_log_probs
 
+    def time_one_batch(
+        self,
+        trajectories: List[Tuple[np.ndarray, np.ndarray]],
+        batch_size: int = 64
+    ) -> Dict[str, float]:
+        """Run one optimizer update and report synchronized per-transition timing."""
+        if len(trajectories) < batch_size:
+            raise ValueError(
+                f"Not enough trajectory windows for batch_size={batch_size}: "
+                f"only {len(trajectories)} windows available."
+            )
+
+        self.reward_network.train()
+        batch_trajs = trajectories[:batch_size]
+        batch_transitions = sum(states.shape[0] for states, _ in batch_trajs)
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+
+        traj_rewards = self.trajectory_computer.compute_trajectory_rewards(batch_trajs)
+        loss = self.objective.compute_loss(traj_rewards)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        end = time.perf_counter()
+
+        batch_time = end - start
+        return {
+            'batch_samples': len(batch_trajs),
+            'batch_transitions': batch_transitions,
+            'batch_time_seconds': batch_time,
+            'seconds_per_sample': batch_time / len(batch_trajs),
+            'seconds_per_transition': batch_time / batch_transitions,
+            'loss': loss.item(),
+        }
+
     def train(
         self,
         trajectories: List[Tuple[np.ndarray, np.ndarray]],
@@ -667,7 +708,8 @@ def run_irl_recovery(
     experiment_prefix: Optional[str] = None,
     save_dir: str = 'experiment/irl',
     combined_or_train_data_path: str = None,
-    eval_data_path: str = None
+    eval_data_path: str = None,
+    time_one_batch: bool = False
 ) -> Tuple[MaxSLPIRLTrainer, Dict]:
     """
     Run the full IRL reward recovery pipeline.
@@ -746,7 +788,17 @@ def run_irl_recovery(
         learning_rate=learning_rate,
         temperature=temperature
     )
-    
+
+    if time_one_batch:
+        timing = trainer.time_one_batch(train_windows, batch_size=batch_size)
+        print(f"MAXENT_BATCH_SAMPLES={timing['batch_samples']}")
+        print(f"MAXENT_BATCH_TRANSITIONS={timing['batch_transitions']}")
+        print(f"MAXENT_BATCH_TIME_SECONDS={timing['batch_time_seconds']}")
+        print(f"MAXENT_SECONDS_PER_SAMPLE={timing['seconds_per_sample']}")
+        print(f"MAXENT_SECONDS_PER_TRANSITION={timing['seconds_per_transition']}")
+        print(f"MAXENT_BATCH_LOSS={timing['loss']}")
+        return trainer, {'timing': timing}
+
     history = trainer.train(
         trajectories=train_windows,
         n_epochs=n_epochs,
@@ -798,6 +850,8 @@ if __name__ == "__main__":
     parser.add_argument('--eval_data_path', type=str, default=None,
                        help='Path to evaluation dataset (for val/test). If provided, enables '
                             'dual-dataset mode where this dataset is split 50/50 into val/test.')
+    parser.add_argument('--time_one_batch', action='store_true',
+                       help='Run one MaxEnt IRL training update, print timing, and exit.')
 
     args = parser.parse_args()
 
@@ -824,5 +878,6 @@ if __name__ == "__main__":
         experiment_prefix=args.prefix,
         save_dir=args.save_dir,
         combined_or_train_data_path=args.combined_or_train_data_path,
-        eval_data_path=args.eval_data_path
+        eval_data_path=args.eval_data_path,
+        time_one_batch=args.time_one_batch
     )

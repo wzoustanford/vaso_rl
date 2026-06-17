@@ -128,6 +128,8 @@ def train_lstm_block_discrete_cql(
     log_dir: str = 'logs',
     log_every: int = 1,  # Log every epoch
     reward_model_path: str = None,
+    reward_source: str = "manual",
+    reward_prefix_override: str = None,
     suffix: str = "",
     reward_combine_lambda: float = None,
     combined_or_train_data_path: str = None,
@@ -158,7 +160,10 @@ def train_lstm_block_discrete_cql(
         save_dir: Directory to save models
         log_dir: Directory to save logs
         log_every: Log every N epochs
-        reward_model_path: Path to learned reward model (gcl/iq_learn/maxent/unet)
+        reward_model_path: Path to learned reward model (gcl/iq_learn/maxent/unet/transformer)
+        reward_source: Reward source to use when reward_model_path is None.
+            Supports 'manual' and 'mortality_only'.
+        reward_prefix_override: Optional exact reward prefix for checkpoint naming.
         suffix: Suffix to add to experiment prefix
         reward_combine_lambda: If None, use pure IRL reward. If in [0, 1], use
             (1 - lambda) * manual_reward + lambda * irl_reward.
@@ -206,9 +211,13 @@ def train_lstm_block_discrete_cql(
     # Initialize data pipeline and infer reward type
     logger.log("\nInitializing data pipeline...")
     if reward_model_path is None:
-        reward_type = "manual"
+        if reward_source not in ("manual", "mortality_only"):
+            raise ValueError(
+                f"reward_source='{reward_source}' requires --reward_model_path unless it is manual or mortality_only"
+            )
+        reward_type = reward_source
         pipeline = IntegratedDataPipelineV3(
-            model_type='dual', reward_source='manual', random_seed=42,
+            model_type='dual', reward_source=reward_source, random_seed=42,
             combined_or_train_data_path=combined_or_train_data_path,
             eval_data_path=eval_data_path
         )
@@ -250,6 +259,17 @@ def train_lstm_block_discrete_cql(
         # Use irl_vp2_bins for loading (IRL model's action space), not vp2_bins (Q-learning action space)
         pipeline.load_semi_supervised_unet_reward_model(reward_model_path, vp1_bins=2, vp2_bins=irl_vp2_bins)
         logger.log(f"  IRL model vp2_bins: {irl_vp2_bins}, Q-learning vp2_bins: {vp2_bins}")
+    elif 'transformer' in reward_model_path:
+        reward_type = "transformer"
+        pipeline = IntegratedDataPipelineV3(
+            model_type='dual', reward_source='learned', random_seed=42,
+            reward_combine_lambda=reward_combine_lambda,
+            combined_or_train_data_path=combined_or_train_data_path,
+            eval_data_path=eval_data_path
+        )
+        # Use irl_vp2_bins for loading (IRL model's action space), not vp2_bins (Q-learning action space)
+        pipeline.load_trans_reward_model(reward_model_path, vp1_bins=2, vp2_bins=irl_vp2_bins)
+        logger.log(f"  IRL model vp2_bins: {irl_vp2_bins}, Q-learning vp2_bins: {vp2_bins}")
     elif 'unet' in reward_model_path:
         reward_type = "unet"
         pipeline = IntegratedDataPipelineV3(
@@ -265,7 +285,9 @@ def train_lstm_block_discrete_cql(
         raise ValueError(f"Cannot infer reward model type from path: {reward_model_path}")
 
     # Use pipeline's get_reward_prefix for correct naming with lambda
-    experiment_prefix = pipeline.get_reward_prefix() if hasattr(pipeline, 'get_reward_prefix') else reward_type
+    experiment_prefix = reward_prefix_override or (
+        pipeline.get_reward_prefix() if hasattr(pipeline, 'get_reward_prefix') else reward_type
+    )
     experiment_prefix = f"lstm_{experiment_prefix}{suffix}"
 
     logger.log(f"Reward type: {reward_type}")
@@ -645,7 +667,12 @@ def main():
     parser.add_argument('--grad_clip', type=float, default=1.0,
                        help='Gradient clipping value (default: 1.0)')
     parser.add_argument('--reward_model_path', type=str, default=None,
-                       help='Path to learned reward model (gcl/iq_learn/maxent/unet). None=manual reward')
+                       help='Path to learned reward model (gcl/iq_learn/maxent/unet/transformer). None=manual reward')
+    parser.add_argument('--reward_source', type=str, default='manual',
+                       choices=['manual', 'mortality_only'],
+                       help='Reward source to use when --reward_model_path is not provided.')
+    parser.add_argument('--reward_prefix_override', type=str, default=None,
+                       help='Optional exact reward prefix for checkpoint naming.')
     parser.add_argument('--suffix', type=str, default='',
                        help='Suffix to add to experiment prefix (e.g., "_test")')
     parser.add_argument('--save_dir', type=str, default='experiment/ql',
@@ -684,7 +711,8 @@ def main():
     print(f"  - Sequence length: {args.sequence_length}", flush=True)
     print(f"  - Burn-in length: {args.burn_in_length}", flush=True)
     print(f"  - LSTM hidden: {args.lstm_hidden}", flush=True)
-    print(f"  - Reward model: {args.reward_model_path or 'manual'}", flush=True)
+    print(f"  - Reward model: {args.reward_model_path or 'None'}", flush=True)
+    print(f"  - Reward source: {args.reward_source}", flush=True)
     print(f"  - Reward combine lambda: {args.reward_combine_lambda}", flush=True)
     print(f"  - Suffix: {args.suffix}", flush=True)
     print(f"  - Total discrete actions: {2 * args.vp2_bins}", flush=True)
@@ -715,6 +743,8 @@ def main():
         save_dir=args.save_dir,
         log_dir=args.log_dir,
         reward_model_path=args.reward_model_path,
+        reward_source=args.reward_source,
+        reward_prefix_override=args.reward_prefix_override,
         suffix=args.suffix,
         reward_combine_lambda=args.reward_combine_lambda,
         combined_or_train_data_path=args.combined_or_train_data_path,

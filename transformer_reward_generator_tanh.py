@@ -7,6 +7,8 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 import os
 import json
+import re
+import time
 from datetime import datetime
 
 # Local imports
@@ -45,7 +47,7 @@ class Config:
     eval_q_t_step2: int = 20      # Second timestep to evaluate Q
 
     # Sequence buffer
-    sequence_length: int = 40     # Will be set based on data
+    sequence_length: int = 512     # Will be set based on data
     overlap: int = 1              # As specified in prompts
 
     # Paths
@@ -59,8 +61,7 @@ class Config:
         self.action_size = self.vp1_bins * self.vp2_bins
 
 ## Transformer Architecture
-# keep the class name for consistency
-class TransformerCIRLRewardGenerator(nn.Module):
+class TransformerRewardGenerator(nn.Module):
     """
     Transformer reward model that takes trajectories and outputs per-timestep rewards.
 
@@ -96,6 +97,15 @@ class TransformerCIRLRewardGenerator(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # Transformer Encoder
+        # nn.TransformerEncoderLayer with batch_first=True expects:
+        # input:  [batch, seq_len, d_model]
+        # output: [batch, seq_len, d_model]
+        #
+        # Model inputs:
+        # input_projection: [batch, seq_len, state_size + action_size] -> [batch, seq_len, d_model]
+        # position_embedding is added with shape [1, seq_len, d_model]
+        # dropout preserves shape: [batch, seq_len, d_model]
+        # therefore, input to transformer is [batch, seq_len, d_model]
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -142,6 +152,8 @@ class TransformerCIRLRewardGenerator(nn.Module):
 
         # No mask
         x = self.transformer(x)
+
+        # Output dimension: [batch, seq_len, d_model] -> [batch, seq_len, 1]
         x = self.ln_f(x)
         return self.output_layer(x)
 
@@ -198,7 +210,7 @@ def load_trajectories(data_pipeline, config: Config) -> tuple:
 
 
 def compute_training_step(
-    model: TransformerCIRLRewardGenerator,
+    model: TransformerRewardGenerator,
     states: torch.Tensor,
     actions: torch.Tensor,
     config: Config,
@@ -208,7 +220,7 @@ def compute_training_step(
     Compute loss for one batch of sequences.
 
     Args:
-        model: TransformerCIRLRewardGenerator
+        model: TransformerRewardGenerator
         states: [batch, seq_len, state_size]
         actions: [batch, seq_len, 2] - expert actions (vp1, vp2) continuous
         config: Configuration
@@ -292,7 +304,7 @@ def compute_training_step(
 
 
 def evaluate_validation(
-    model: TransformerCIRLRewardGenerator,
+    model: TransformerRewardGenerator,
     val_buffer,
     config: Config,
     device: torch.device
@@ -384,7 +396,7 @@ def evaluate_validation(
     }
 
 
-def train(config: Config, data_pipeline):
+def train(config: Config, data_pipeline, resume_model_path: str = None, time_one_batch: bool = False):
     """
     Main training loop for transformer reward generator.
     """
@@ -401,19 +413,45 @@ def train(config: Config, data_pipeline):
     # Create validation buffer (using same pipeline but could be separate)
     val_buffer = buffer  # TODO: Create separate val buffer if needed
 
+    start_epoch = 0
+
     # Initialize model
-    print(f"[DEBUG] Initializing transformer reward generator with state_size={state_size}, action_size={config.action_size}")
-    model = TransformerCIRLRewardGenerator(
-        state_size=state_size,
-        action_size=config.action_size,
-        d_model=config.d_model,
-        nhead=config.nhead,
-        num_layers=config.num_layers,
-        d_ff=config.d_ff,
-        dropout=config.dropout,
-        max_seq_length=config.sequence_length,
-    ).to(device)
-    print("[DEBUG] Model initialized")
+    if resume_model_path:
+        print(f"[DEBUG] Resuming transformer reward generator from {resume_model_path}")
+        model, checkpoint_config = load_model(resume_model_path, device=device)
+
+        if model.action_size != config.action_size:
+            raise ValueError(
+                f"Checkpoint action_size={model.action_size} does not match requested "
+                f"action_size={config.action_size}"
+            )
+        if model.d_model != config.d_model or model.num_layers != config.num_layers:
+            raise ValueError(
+                "Checkpoint architecture does not match requested transformer settings. "
+                f"checkpoint=(d_model={model.d_model}, num_layers={model.num_layers}) "
+                f"requested=(d_model={config.d_model}, num_layers={config.num_layers})"
+            )
+
+        config.sequence_length = checkpoint_config.get('sequence_length', config.sequence_length)
+        model.max_seq_length = checkpoint_config.get('sequence_length', model.max_seq_length)
+
+        match = re.search(r'model_epoch_(\d+)\.pt$', os.path.basename(resume_model_path))
+        if match:
+            start_epoch = int(match.group(1))
+        print(f"[DEBUG] Resume start_epoch={start_epoch}, max_seq_length={model.max_seq_length}")
+    else:
+        print(f"[DEBUG] Initializing transformer reward generator with state_size={state_size}, action_size={config.action_size}")
+        model = TransformerRewardGenerator(
+            state_size=state_size,
+            action_size=config.action_size,
+            d_model=config.d_model,
+            nhead=config.nhead,
+            num_layers=config.num_layers,
+            d_ff=config.d_ff,
+            dropout=config.dropout,
+            max_seq_length=config.sequence_length,
+        ).to(device)
+        print("[DEBUG] Model initialized")
 
     optimizer = optim.Adam(model.parameters(), lr=config.learning_rate)
     print("[DEBUG] Optimizer created")
@@ -421,9 +459,17 @@ def train(config: Config, data_pipeline):
     step = 0
     n_batches = len(buffer) // config.batch_size
     print(f"[DEBUG] Starting training: {config.num_epochs} epochs, {n_batches} batches per epoch")
+    if n_batches == 0:
+        raise ValueError(
+            f"Not enough sequences for batch_size={config.batch_size}: "
+            f"buffer has {len(buffer)} sequences. Use a smaller --trans_batch_size "
+            "or a dataset with more generated sequences."
+        )
 
-    for epoch in range(config.num_epochs):
-        print(f"[DEBUG] Epoch {epoch+1}/{config.num_epochs} starting...")
+    epochs_to_run = 1 if time_one_batch else config.num_epochs
+    for epoch in range(epochs_to_run):
+        absolute_epoch = start_epoch + epoch + 1
+        print(f"[DEBUG] Epoch {absolute_epoch} ({epoch+1}/{epochs_to_run} resumed-run) starting...")
         model.train()
         epoch_loss = 0.0
         epoch_acc = 0.0
@@ -431,7 +477,7 @@ def train(config: Config, data_pipeline):
 
         for batch_idx in range(n_batches):
             if batch_idx % 10 == 0:
-                print(f"[DEBUG] Epoch {epoch+1}, Batch {batch_idx}/{n_batches}...")
+                print(f"[DEBUG] Epoch {absolute_epoch}, Batch {batch_idx}/{n_batches}...")
 
             print(f"[DEBUG] Sampling sequences...") if batch_idx == 0 else None
             burn_in, training, indices, weights = buffer.sample_sequences(config.batch_size)
@@ -443,6 +489,30 @@ def train(config: Config, data_pipeline):
 
             optimizer.zero_grad()
             print(f"[DEBUG] Calling compute_training_step...") if batch_idx == 0 else None
+
+            if time_one_batch:
+                batch_transitions = states.shape[0] * states.shape[1]
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                start = time.perf_counter()
+                loss, metrics = compute_training_step(model, states, actions, config, device)
+                loss.backward()
+                optimizer.step()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                end = time.perf_counter()
+                batch_time = end - start
+                timing_save_path = os.path.join(config.experiment_dir, "timing_batch_model.pt")
+                save_model(model, config, timing_save_path)
+                print(f"TRANSFORMER_BATCH_SHAPE={tuple(states.shape)}")
+                print(f"TRANSFORMER_BATCH_SAMPLES={states.shape[0]}")
+                print(f"TRANSFORMER_BATCH_TRANSITIONS={batch_transitions}")
+                print(f"TRANSFORMER_BATCH_TIME_SECONDS={batch_time}")
+                print(f"TRANSFORMER_SECONDS_PER_SAMPLE={batch_time / states.shape[0]}")
+                print(f"TRANSFORMER_SECONDS_PER_TRANSITION={batch_time / batch_transitions}")
+                print(f"TRANSFORMER_TIMING_MODEL_PATH={timing_save_path}")
+                return model
+
             loss, metrics = compute_training_step(model, states, actions, config, device)
             print(f"[DEBUG] Loss computed: {loss.item():.4f}") if batch_idx == 0 else None
 
@@ -468,7 +538,7 @@ def train(config: Config, data_pipeline):
                 model.train()  # Back to train mode
 
         # End of epoch
-        print(f"Epoch {epoch+1}/{config.num_epochs} complete")
+        print(f"Epoch {absolute_epoch} complete")
 
         # Save model each epoch
         save_path = os.path.join(config.experiment_dir, f"transformer_context_irl_model_epoch_{epoch+1}.pt")
@@ -480,12 +550,12 @@ def train(config: Config, data_pipeline):
 
 ## Model saving and loading functions
 
-def save_model(model: TransformerCIRLRewardGenerator, config: Config, filepath: str):
+def save_model(model: TransformerRewardGenerator, config: Config, filepath: str):
     """
     Save model checkpoint.
 
     Args:
-        model: TransformerCIRLRewardGenerator model
+        model: TransformerRewardGenerator model
         config: Configuration object
         filepath: Path to save the model
     """
@@ -531,7 +601,7 @@ def load_model(filepath: str, device: torch.device = None) -> tuple:
 
     checkpoint = torch.load(filepath, map_location=device)
 
-    model = TransformerCIRLRewardGenerator(
+    model = TransformerRewardGenerator(
         state_size=checkpoint['state_size'],
         action_size=checkpoint['action_size'],
         d_model=checkpoint['d_model'],
@@ -566,16 +636,22 @@ def main():
     parser.add_argument('--dropout', type=float, default=0.1, help='Transformer dropout')
     parser.add_argument('--D', type=int, default=10, help='Q-value horizon')
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
+    parser.add_argument('--sequence_length', type=int, default=512,
+                       help='Sequence length for trajectory windows')
     parser.add_argument('--vp1_bins', type=int, default=2, help='VP1 bins')
     parser.add_argument('--vp2_bins', type=int, default=5, help='VP2 bins')
     parser.add_argument('--experiment_dir', type=str, default='experiments/transformer_reward_gen',
                        help='Directory to save models')
+    parser.add_argument('--resume_model_path', type=str, default=None,
+                       help='Path to a saved transformer checkpoint to continue training from')
     parser.add_argument('--combined_or_train_data_path', type=str, default=None,
                        help='Path to training dataset. If eval_data_path is also provided, '
                             'all patients from this dataset are used for training.')
     parser.add_argument('--eval_data_path', type=str, default=None,
                        help='Path to evaluation dataset (for val/test). If provided, enables '
                             'dual-dataset mode where this dataset is split 50/50 into val/test.')
+    parser.add_argument('--time_one_batch', action='store_true',
+                       help='Run one transformer training batch, print timing, and exit.')
     args = parser.parse_args()
 
     # Initialize config from command line args
@@ -590,6 +666,7 @@ def main():
         dropout=args.dropout,
         D=args.D,
         gamma=args.gamma,
+        sequence_length=args.sequence_length,
         vp1_bins=args.vp1_bins,
         vp2_bins=args.vp2_bins,
         experiment_dir=args.experiment_dir+f"_{args.d_model}d_{args.num_layers}l_tanh",
@@ -619,7 +696,12 @@ def main():
     )
 
     # Train model
-    model = train(config, pipeline)
+    model = train(
+        config,
+        pipeline,
+        resume_model_path=args.resume_model_path,
+        time_one_batch=args.time_one_batch,
+    )
 
     print("Done!")
 

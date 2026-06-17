@@ -10,6 +10,7 @@
 #   ./run_experiment.sh iq_learn --iq_init_temp 0.01 --iq_tau 0.01 --iq_lr 1e-3 --iq_div chi
 #   ./run_experiment.sh unet --unet_epochs 100 --unet_conv_h_dim 16
 #   ./run_experiment.sh unet --skip_irl --irl_model_path experiments/unet/model_epoch_100.pt
+#   ./run_experiment.sh unet --mortality_reward_only --ql_epochs 100
 #   ./run_experiment.sh unet --unet_ablation causal  # Run with causal ablation
 #   ./run_experiment.sh unet --unet_ablation single_transition_context  # Run with single transition context
 #   ./run_experiment.sh semi_supervised_unet --unet_epochs 100 --unet_conv_h_dim 64
@@ -34,10 +35,11 @@ set -e  # Exit on error
 # Default values
 ALGORITHM="${1:-gcl}"
 IRL_EPOCHS=100
-QL_EPOCHS=100
+QL_EPOCHS=50
 VP2_BINS=5
 TEST_MODE=false
 SUFFIX=""
+TIME_ONE_BATCH=false
 
 # GCL-specific defaults
 GCL_TAU=0.005
@@ -58,6 +60,7 @@ UNET_GAMMA=0.99
 UNET_LR=1e-4
 UNET_ABLATION=""  # Empty means no ablation (default)
 SKIP_IRL=false
+MORTALITY_REWARD_ONLY=false
 
 # IRL model vp2_bins (for loading pre-trained models with different vp2_bins)
 IRL_VP2_BINS=""  # Empty means use same as VP2_BINS
@@ -107,8 +110,16 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --suffix)
+            if [[ $# -lt 2 || "$2" == --* ]]; then
+                echo "Error: --suffix requires a non-option argument"
+                exit 1
+            fi
             SUFFIX="$2"
             shift 2
+            ;;
+        --time_one_batch)
+            TIME_ONE_BATCH=true
+            shift
             ;;
         --gcl_tau)
             GCL_TAU="$2"
@@ -163,6 +174,11 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --skip_irl)
+            SKIP_IRL=true
+            shift
+            ;;
+        --mortality_reward_only)
+            MORTALITY_REWARD_ONLY=true
             SKIP_IRL=true
             shift
             ;;
@@ -234,6 +250,16 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ "$SUFFIX" =~ ^[[:space:]]*$ ]]; then
+    SUFFIX=""
+else
+    SUFFIX="$(printf '%s' "$SUFFIX" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ "$SUFFIX" =~ [[:space:]] ]]; then
+        echo "Error: --suffix must not contain whitespace"
+        exit 1
+    fi
+fi
+
 echo "=============================================="
 echo "Experiment Pipeline"
 echo "=============================================="
@@ -242,7 +268,9 @@ echo "IRL Epochs: $IRL_EPOCHS"
 echo "QL Epochs: $QL_EPOCHS"
 echo "VP2 Bins: $VP2_BINS"
 echo "Test Mode: $TEST_MODE"
+echo "Time One Batch: $TIME_ONE_BATCH"
 echo "Skip IRL: $SKIP_IRL"
+echo "Mortality reward only: $MORTALITY_REWARD_ONLY"
 echo "Suffix: $SUFFIX"
 if [ "$ALGORITHM" == "gcl" ]; then
     echo "GCL tau: $GCL_TAU"
@@ -319,7 +347,14 @@ mkdir -p "$QL_DIR"
 mkdir -p "$RESULTS_DIR"
 
 # Step 1: IRL Training (skip for manual or if --skip_irl is set)
-if [ "$ALGORITHM" == "manual" ]; then
+if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+    echo ""
+    echo "=============================================="
+    echo "Step 1: Skipping IRL Training (using mortality-only reward)"
+    echo "=============================================="
+    echo "Mortality-only reward is binary: terminal death=1.0, all other transitions=0.0"
+    REWARD_MODEL_PATH=""
+elif [ "$ALGORITHM" == "manual" ]; then
     echo ""
     echo "=============================================="
     echo "Step 1: Skipping IRL Training (using manual reward)"
@@ -357,7 +392,14 @@ else
             if [ -n "$EVAL_DATA_PATH" ]; then
                 MAXENT_CMD="$MAXENT_CMD --eval_data_path $EVAL_DATA_PATH"
             fi
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                MAXENT_CMD="$MAXENT_CMD --time_one_batch"
+            fi
             eval $MAXENT_CMD
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                echo "MaxEnt IRL one-batch timing complete."
+                exit 0
+            fi
             REWARD_MODEL_PATH="${IRL_DIR}/maxent${SUFFIX}_reward_model.pt"
             ;;
         gcl)
@@ -375,7 +417,14 @@ else
             if [ -n "$EVAL_DATA_PATH" ]; then
                 GCL_CMD="$GCL_CMD --eval_data_path $EVAL_DATA_PATH"
             fi
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                GCL_CMD="$GCL_CMD --time_one_batch"
+            fi
             eval $GCL_CMD
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                echo "GCL one-batch timing complete."
+                exit 0
+            fi
             REWARD_MODEL_PATH="${IRL_DIR}/gcl${SUFFIX}_cost_model.pt"
             ;;
         iq_learn)
@@ -394,11 +443,18 @@ else
             if [ -n "$EVAL_DATA_PATH" ]; then
                 IQ_CMD="$IQ_CMD --eval_data_path $EVAL_DATA_PATH"
             fi
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                IQ_CMD="$IQ_CMD --time_one_batch"
+            fi
             eval $IQ_CMD
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                echo "IQ-Learn one-batch timing complete."
+                exit 0
+            fi
             REWARD_MODEL_PATH="${IRL_DIR}/iq_learn${SUFFIX}_q_model.pt"
             ;;
         unet)
-            UNET_DIR="${EXPERIMENT_DIR}/unet_${SUFFIX}"
+            UNET_DIR="${EXPERIMENT_DIR}/unet${SUFFIX}"
             mkdir -p "$UNET_DIR"
             UNET_CMD="python ${SCRIPT_DIR}/unet_reward_generator_tanh.py \
                 --epochs $UNET_EPOCHS \
@@ -414,19 +470,30 @@ else
             if [ -n "$EVAL_DATA_PATH" ]; then
                 UNET_CMD="$UNET_CMD --eval_data_path $EVAL_DATA_PATH"
             fi
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                UNET_CMD="$UNET_CMD --time_one_batch"
+            fi
             if [ -n "$UNET_ABLATION" ]; then
                 UNET_CMD="$UNET_CMD --ablation_setting $UNET_ABLATION"
             fi
             eval $UNET_CMD
-            # Find the latest model (tanh version adds _tanh suffix)
-            REWARD_MODEL_PATH=$(ls -t "${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"/model_epoch_*.pt 2>/dev/null | head -1)
-            if [ -z "$REWARD_MODEL_PATH" ]; then
-                echo "Error: No U-Net model found in ${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"
-                exit 1
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                REWARD_MODEL_PATH="${UNET_DIR}_${UNET_CONV_H_DIM}_tanh/timing_batch_model.pt"
+                if [ ! -f "$REWARD_MODEL_PATH" ]; then
+                    echo "Error: Expected timing-mode U-Net model not found: $REWARD_MODEL_PATH"
+                    exit 1
+                fi
+            else
+                # Find the latest model (tanh version adds _tanh suffix)
+                REWARD_MODEL_PATH=$(ls -t "${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"/model_epoch_*.pt 2>/dev/null | head -1)
+                if [ -z "$REWARD_MODEL_PATH" ]; then
+                    echo "Error: No U-Net model found in ${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"
+                    exit 1
+                fi
             fi
             ;;
         unet_maxent)
-            UNET_DIR="${EXPERIMENT_DIR}/unet_${SUFFIX}"
+            UNET_DIR="${EXPERIMENT_DIR}/unet${SUFFIX}"
             mkdir -p "$UNET_DIR"
             UNET_CMD="python ${SCRIPT_DIR}/unet_reward_generator_tanh_maxent.py \
                 --epochs $UNET_EPOCHS \
@@ -454,7 +521,7 @@ else
             fi
             ;;
         transformer_context_irl)
-            UNET_DIR="${EXPERIMENT_DIR}/transformer_${SUFFIX}"
+            UNET_DIR="${EXPERIMENT_DIR}/transformer${SUFFIX}"
             mkdir -p "$UNET_DIR"
             UNET_CMD="python ${SCRIPT_DIR}/transformer_reward_generator_tanh.py \
                 --epochs $UNET_EPOCHS \
@@ -470,15 +537,26 @@ else
             if [ -n "$EVAL_DATA_PATH" ]; then
                 UNET_CMD="$UNET_CMD --eval_data_path $EVAL_DATA_PATH"
             fi
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                UNET_CMD="$UNET_CMD --time_one_batch"
+            fi
             if [ -n "$UNET_ABLATION" ]; then
                 UNET_CMD="$UNET_CMD --ablation_setting $UNET_ABLATION"
             fi
             eval $UNET_CMD
-            # Find the latest model (tanh version adds _tanh suffix)
-            REWARD_MODEL_PATH=$(ls -t "${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"/transformer_context_irl_model_epoch_*.pt 2>/dev/null | head -1)
-            if [ -z "$REWARD_MODEL_PATH" ]; then
-                echo "Error: No U-Net model found in ${UNET_DIR}_${UNET_CONV_H_DIM}_tanh"
-                exit 1
+            if [ "$TIME_ONE_BATCH" == "true" ]; then
+                REWARD_MODEL_PATH="${UNET_DIR}_${UNET_CONV_H_DIM}d_2l_tanh/timing_batch_model.pt"
+                if [ ! -f "$REWARD_MODEL_PATH" ]; then
+                    echo "Error: Expected timing-mode transformer model not found: $REWARD_MODEL_PATH"
+                    exit 1
+                fi
+            else
+                # Find the latest model (tanh version adds _tanh suffix)
+                REWARD_MODEL_PATH=$(ls -t "${UNET_DIR}_${UNET_CONV_H_DIM}d_2l_tanh"/transformer_context_irl_model_epoch_*.pt 2>/dev/null | head -1)
+                if [ -z "$REWARD_MODEL_PATH" ]; then
+                    echo "Error: No transformer model found in ${UNET_DIR}_${UNET_CONV_H_DIM}d_2l_tanh"
+                    exit 1
+                fi
             fi
             ;;
         semi_supervised_unet)
@@ -544,12 +622,15 @@ if [ "$USE_LSTM" == "true" ]; then
         --save_dir $QL_DIR \
         --log_dir ${EXPERIMENT_DIR}/logs"
 
-    if [ -n "$SUFFIX" ]; then
+    if [[ -n "$SUFFIX" ]]; then
         QL_CMD="$QL_CMD --suffix $SUFFIX"
     fi
 
     if [ -n "$REWARD_MODEL_PATH" ]; then
         QL_CMD="$QL_CMD --reward_model_path $REWARD_MODEL_PATH"
+    fi
+    if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+        QL_CMD="$QL_CMD --reward_source mortality_only --reward_prefix_override ${ALGORITHM}_mortality_only"
     fi
 
     if [ -n "$IRL_VP2_BINS" ]; then
@@ -574,7 +655,9 @@ if [ "$USE_LSTM" == "true" ]; then
     eval $QL_CMD
 
     # Determine the model prefix for LSTM (includes lstm_ prefix)
-    if [ -n "$REWARD_COMBINE_LAMBDA" ]; then
+    if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+        MODEL_PREFIX="lstm_${ALGORITHM}_mortality_only${SUFFIX}"
+    elif [ -n "$REWARD_COMBINE_LAMBDA" ]; then
         LAMBDA_STR=$(echo "$REWARD_COMBINE_LAMBDA" | sed 's/0*$//' | sed 's/\.$//')
         MODEL_PREFIX="lstm_${ALGORITHM}_combined_manual_lambda${LAMBDA_STR}${SUFFIX}"
     else
@@ -583,18 +666,20 @@ if [ "$USE_LSTM" == "true" ]; then
 else
     # Build standard Q-Learning command
     QL_CMD="python ${SCRIPT_DIR}/run_block_discrete_cql_allalphas.py \
-	    --suffix $SUFFIX \
         --single_alpha 0.0 \
         --vp2_bins $VP2_BINS \
         --epochs $QL_EPOCHS \
         --save_dir $QL_DIR"
 
-    if [ -n "$SUFFIX" ]; then
+    if [[ -n "$SUFFIX" ]]; then
         QL_CMD="$QL_CMD --suffix $SUFFIX"
     fi
 
     if [ -n "$REWARD_MODEL_PATH" ]; then
         QL_CMD="$QL_CMD --reward_model_path $REWARD_MODEL_PATH"
+    fi
+    if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+        QL_CMD="$QL_CMD --reward_source mortality_only --reward_prefix_override ${ALGORITHM}_mortality_only"
     fi
 
     if [ -n "$IRL_VP2_BINS" ]; then
@@ -612,21 +697,32 @@ else
     if [ -n "$EVAL_DATA_PATH" ]; then
         QL_CMD="$QL_CMD --eval_data_path $EVAL_DATA_PATH"
     fi
+    if [ "$TIME_ONE_BATCH" == "true" ]; then
+        QL_CMD="$QL_CMD --time_one_batch"
+    fi
 
     eval $QL_CMD
 
     # Determine the model prefix for standard Q-learning
-    if [ -n "$REWARD_COMBINE_LAMBDA" ]; then
+    if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+        MODEL_PREFIX="${ALGORITHM}_mortality_only${SUFFIX}"
+    elif [ -n "$REWARD_COMBINE_LAMBDA" ]; then
         LAMBDA_STR=$(echo "$REWARD_COMBINE_LAMBDA" | sed 's/0*$//' | sed 's/\.$//')
         MODEL_PREFIX="${ALGORITHM}_combined_manual_lambda${LAMBDA_STR}${SUFFIX}"
     else
-        MODEL_PREFIX="${ALGORITHM}_${SUFFIX}"
+        MODEL_PREFIX="${ALGORITHM}${SUFFIX}"
     fi
 fi
 
 # Find the saved Q-learning model (alpha format is 0.0000)
-QL_MODEL_PATH="${QL_DIR}/${MODEL_PREFIX}_alpha0.0000_bins${VP2_BINS}_best.pt"
-echo "Q-Learning complete. Model saved to: $QL_MODEL_PATH"
+if [ "$TIME_ONE_BATCH" == "true" ]; then
+    QL_MODEL_PATH="N/A (time_one_batch mode)"
+    echo "Q-Learning one-batch timing complete."
+    exit 0
+else
+    QL_MODEL_PATH="${QL_DIR}/${MODEL_PREFIX}_alpha0.0000_bins${VP2_BINS}_best.pt"
+    echo "Q-Learning complete. Model saved to: $QL_MODEL_PATH"
+fi
 
 # Step 3: WIS Evaluation
 echo ""
@@ -653,6 +749,9 @@ else
 
     if [ -n "$EVAL_DATA_PATH" ]; then
         WIS_CMD="$WIS_CMD --eval_data_path $EVAL_DATA_PATH"
+    fi
+    if [ "$MORTALITY_REWARD_ONLY" == "true" ]; then
+        WIS_CMD="$WIS_CMD --reward_type mortality_only"
     fi
 
     eval $WIS_CMD 2>&1 | tee "$RESULTS_FILE"
